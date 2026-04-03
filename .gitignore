@@ -1,0 +1,6 @@
+# Local datasets / archives (large or machine-specific)
+Data/
+DataZIP/
+
+# macOS Finder metadata
+.DS_Store
