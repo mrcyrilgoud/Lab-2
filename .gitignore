@@ -1,6 +1,10 @@
 # Local datasets / archives (large or machine-specific)
 Data/
 DataZIP/
+ImageNet/
+
+# NPU calibration exports (e.g. runs/.../calibration)
+calibration/
 
 # macOS Finder metadata
 .DS_Store
