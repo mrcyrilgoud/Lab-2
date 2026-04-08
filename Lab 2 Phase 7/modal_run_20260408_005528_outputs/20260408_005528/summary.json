@@ -1,0 +1,487 @@
+{
+  "model_id": "mixed_kernel_residual",
+  "run_id": "20260408_005528",
+  "modal_environment": "",
+  "data_root": "/mnt/lab2-phase7-data/Data",
+  "run_root": "/mnt/lab2-phase7-data/runs/phase7b_modal_stable_checkpointed/mixed_kernel_residual/20260408_005528",
+  "stage_root": "/mnt/lab2-phase7-data/runs/phase7b_modal_stable_checkpointed/mixed_kernel_residual/20260408_005528/stages",
+  "export_root": "/mnt/lab2-phase7-data/runs/phase7b_modal_stable_checkpointed/mixed_kernel_residual/20260408_005528/exports",
+  "validation_root": "/mnt/lab2-phase7-data/runs/phase7b_modal_stable_checkpointed/mixed_kernel_residual/20260408_005528/validation",
+  "config": {
+    "benchmark_preset": null,
+    "batch_size": 24,
+    "train_num_workers": 8,
+    "eval_num_workers": 2,
+    "prefetch_factor": 2,
+    "dataloader_timeout_sec": 300,
+    "stage_epochs": {
+      "synthetic_warmup": 6,
+      "mixed_finetune": 24,
+      "paired_polish": 20
+    },
+    "run_synthetic_val": true,
+    "run_synthetic_train_eval": true,
+    "run_full_training": true,
+    "run_onnx_export": true
+  },
+  "device": "cuda",
+  "amp_policy": "bf16",
+  "model_spec": {
+    "display_name": "ResidualConvSR_mixed_3_3_5",
+    "build_model": "<function <lambda> at 0x2b83ebc5b240>",
+    "model_cfg": {
+      "channels": 96,
+      "kernel_pattern": [
+        3,
+        3,
+        5,
+        3,
+        3,
+        5,
+        3,
+        3,
+        5,
+        3,
+        3,
+        5,
+        3,
+        3,
+        5,
+        3,
+        3,
+        5
+      ]
+    },
+    "params": 2386563,
+    "module_ops": {
+      "Conv2d": 20,
+      "PReLU": 19
+    }
+  },
+  "best_checkpoint_by_stage": {
+    "synthetic_warmup": "/mnt/lab2-phase7-data/runs/phase7b_modal_stable_checkpointed/mixed_kernel_residual/20260408_005528/stages/synthetic_warmup/best.pt",
+    "mixed_finetune": "/mnt/lab2-phase7-data/runs/phase7b_modal_stable_checkpointed/mixed_kernel_residual/20260408_005528/stages/mixed_finetune/best.pt",
+    "paired_polish": "/mnt/lab2-phase7-data/runs/phase7b_modal_stable_checkpointed/mixed_kernel_residual/20260408_005528/stages/paired_polish/best.pt"
+  },
+  "final_best_checkpoint": "/mnt/lab2-phase7-data/runs/phase7b_modal_stable_checkpointed/mixed_kernel_residual/20260408_005528/stages/paired_polish/best.pt",
+  "stage_summaries": {
+    "synthetic_warmup": {
+      "stage": "synthetic_warmup",
+      "best_epoch": 1,
+      "best_metric": 21.336104888916015,
+      "best_ckpt": "/mnt/lab2-phase7-data/runs/phase7b_modal_stable_checkpointed/mixed_kernel_residual/20260408_005528/stages/synthetic_warmup/best.pt",
+      "last_row": {
+        "epoch": 6,
+        "lr": 2.3999999999999997e-05,
+        "stage": "synthetic_warmup",
+        "model_id": "mixed_kernel_residual",
+        "loss_target": "delta_hr_minus_lr_l1",
+        "train_loss": 0.044306395227710405,
+        "train_psnr_online": 23.540623826768662,
+        "hrlr_train_loss": 0.04081239248625934,
+        "hrlr_train_psnr": 26.477264523506165,
+        "hrlr_train_input_psnr": 26.47749638557434,
+        "hrlr_train_delta_psnr": -0.00023212656378746033,
+        "hrlr_train_residual_ratio": 0.00045027522719465196,
+        "hrlr_val_loss": 0.06237189441919327,
+        "hrlr_val_psnr": 21.33614486694336,
+        "hrlr_val_input_psnr": 21.336162567138672,
+        "hrlr_val_delta_psnr": -1.819610595703125e-05,
+        "hrlr_val_residual_ratio": 0.00019742482458241285,
+        "hrlr_val_hard_psnr": 19.11111780492271,
+        "hrlr_val_mid_psnr": 22.779129607336863,
+        "hrlr_val_easy_psnr": 24.80912144978841,
+        "hrlr_val_worst10": [
+          {
+            "name": "000557",
+            "source": "paired_val",
+            "input_psnr": 16.282670974731445,
+            "pred_psnr": 16.282684326171875,
+            "delta_psnr": 1.33514404296875e-05,
+            "residual_ratio": 0.0001006883176160045
+          },
+          {
+            "name": "000186",
+            "source": "paired_val",
+            "input_psnr": 16.472238540649414,
+            "pred_psnr": 16.472232818603516,
+            "delta_psnr": -5.7220458984375e-06,
+            "residual_ratio": 9.649911226006225e-05
+          },
+          {
+            "name": "000156",
+            "source": "paired_val",
+            "input_psnr": 17.116708755493164,
+            "pred_psnr": 17.11672592163086,
+            "delta_psnr": 1.71661376953125e-05,
+            "residual_ratio": 0.0001179067839984782
+          },
+          {
+            "name": "000120",
+            "source": "paired_val",
+            "input_psnr": 17.306196212768555,
+            "pred_psnr": 17.306196212768555,
+            "delta_psnr": 0.0,
+            "residual_ratio": 0.00011276843724772334
+          },
+          {
+            "name": "000210",
+            "source": "paired_val",
+            "input_psnr": 17.31226348876953,
+            "pred_psnr": 17.3122615814209,
+            "delta_psnr": -1.9073486328125e-06,
+            "residual_ratio": 0.00011274425924057141
+          },
+          {
+            "name": "000166",
+            "source": "paired_val",
+            "input_psnr": 17.417705535888672,
+            "pred_psnr": 17.417695999145508,
+            "delta_psnr": -9.5367431640625e-06,
+            "residual_ratio": 0.00011916650692000985
+          },
+          {
+            "name": "00090",
+            "source": "paired_val",
+            "input_psnr": 17.519367218017578,
+            "pred_psnr": 17.51936912536621,
+            "delta_psnr": 1.9073486328125e-06,
+            "residual_ratio": 0.00011297425953671336
+          },
+          {
+            "name": "000160",
+            "source": "paired_val",
+            "input_psnr": 17.681724548339844,
+            "pred_psnr": 17.681713104248047,
+            "delta_psnr": -1.1444091796875e-05,
+            "residual_ratio": 0.00011548437032615766
+          },
+          {
+            "name": "000130",
+            "source": "paired_val",
+            "input_psnr": 17.805370330810547,
+            "pred_psnr": 17.80535125732422,
+            "delta_psnr": -1.9073486328125e-05,
+            "residual_ratio": 0.0001232219219673425
+          },
+          {
+            "name": "000208",
+            "source": "paired_val",
+            "input_psnr": 17.914222717285156,
+            "pred_psnr": 17.91421890258789,
+            "delta_psnr": -3.814697265625e-06,
+            "residual_ratio": 0.00012187698303023353
+          }
+        ],
+        "synthetic_train_loss": 0.04183157777879387,
+        "synthetic_train_psnr": 23.772148847579956,
+        "synthetic_train_input_psnr": 23.77212619781494,
+        "synthetic_train_delta_psnr": 2.2746622562408447e-05,
+        "synthetic_train_residual_ratio": 0.0003027985876542516,
+        "synthetic_val_loss": 0.04396707273554057,
+        "synthetic_val_psnr": 23.589053511619568,
+        "synthetic_val_input_psnr": 23.589046120643616,
+        "synthetic_val_delta_psnr": 7.092952728271484e-06,
+        "synthetic_val_residual_ratio": 0.0002869651398214046,
+        "combined_train_status": "ok",
+        "combined_train_loss": 0.041321985132526606,
+        "combined_train_psnr": 25.12470668554306,
+        "combined_train_input_psnr": 25.12481129169464,
+        "combined_train_delta_psnr": -0.00010468997061252594,
+        "combined_train_residual_ratio": 0.0003765369074244518,
+        "combined_val_status": "ok",
+        "combined_val_loss": 0.05316948357736692,
+        "combined_val_psnr": 22.462599189281462,
+        "combined_val_input_psnr": 22.462604343891144,
+        "combined_val_delta_psnr": -5.551576614379882e-06,
+        "combined_val_residual_ratio": 0.00024219498220190872,
+        "count": 0,
+        "seconds": 132.7,
+        "selection_metric": "hrlr_val_psnr",
+        "synthetic_train_status": "ok",
+        "synthetic_val_status": "ok",
+        "selection_metric_value": 21.33614486694336
+      }
+    },
+    "mixed_finetune": {
+      "stage": "mixed_finetune",
+      "best_epoch": 1,
+      "best_metric": 21.336150665283203,
+      "best_ckpt": "/mnt/lab2-phase7-data/runs/phase7b_modal_stable_checkpointed/mixed_kernel_residual/20260408_005528/stages/mixed_finetune/best.pt",
+      "last_row": {
+        "epoch": 11,
+        "lr": 9.882344467495186e-05,
+        "stage": "mixed_finetune",
+        "model_id": "mixed_kernel_residual",
+        "loss_target": "delta_hr_minus_lr_l1",
+        "train_loss": 0.04685324739630772,
+        "train_psnr_online": 23.793760119689292,
+        "hrlr_train_loss": 0.03767841652734205,
+        "hrlr_train_psnr": 26.991632103919983,
+        "hrlr_train_input_psnr": 26.991573214530945,
+        "hrlr_train_delta_psnr": 5.839020013809204e-05,
+        "hrlr_train_residual_ratio": 0.00026618229458108544,
+        "hrlr_val_loss": 0.062371442019939424,
+        "hrlr_val_psnr": 21.33617088317871,
+        "hrlr_val_input_psnr": 21.336162567138672,
+        "hrlr_val_delta_psnr": 8.23974609375e-06,
+        "hrlr_val_residual_ratio": 0.00011612766655161977,
+        "hrlr_val_hard_psnr": 19.11112915597311,
+        "hrlr_val_mid_psnr": 22.77916649409703,
+        "hrlr_val_easy_psnr": 24.80915896097819,
+        "hrlr_val_worst10": [
+          {
+            "name": "000557",
+            "source": "paired_val",
+            "input_psnr": 16.282670974731445,
+            "pred_psnr": 16.28267478942871,
+            "delta_psnr": 3.814697265625e-06,
+            "residual_ratio": 5.9228124882793054e-05
+          },
+          {
+            "name": "000186",
+            "source": "paired_val",
+            "input_psnr": 16.472238540649414,
+            "pred_psnr": 16.47224235534668,
+            "delta_psnr": 3.814697265625e-06,
+            "residual_ratio": 5.6762648455332965e-05
+          },
+          {
+            "name": "000156",
+            "source": "paired_val",
+            "input_psnr": 17.116708755493164,
+            "pred_psnr": 17.11671257019043,
+            "delta_psnr": 3.814697265625e-06,
+            "residual_ratio": 6.935173587407917e-05
+          },
+          {
+            "name": "000120",
+            "source": "paired_val",
+            "input_psnr": 17.306196212768555,
+            "pred_psnr": 17.306201934814453,
+            "delta_psnr": 5.7220458984375e-06,
+            "residual_ratio": 6.63307000650093e-05
+          },
+          {
+            "name": "000210",
+            "source": "paired_val",
+            "input_psnr": 17.31226348876953,
+            "pred_psnr": 17.31226348876953,
+            "delta_psnr": 0.0,
+            "residual_ratio": 6.631693395320326e-05
+          },
+          {
+            "name": "000166",
+            "source": "paired_val",
+            "input_psnr": 17.417705535888672,
+            "pred_psnr": 17.417709350585938,
+            "delta_psnr": 3.814697265625e-06,
+            "residual_ratio": 7.009646651567891e-05
+          },
+          {
+            "name": "00090",
+            "source": "paired_val",
+            "input_psnr": 17.519367218017578,
+            "pred_psnr": 17.519372940063477,
+            "delta_psnr": 5.7220458984375e-06,
+            "residual_ratio": 6.645439862040803e-05
+          },
+          {
+            "name": "000160",
+            "source": "paired_val",
+            "input_psnr": 17.681724548339844,
+            "pred_psnr": 17.68172836303711,
+            "delta_psnr": 3.814697265625e-06,
+            "residual_ratio": 6.792884960304946e-05
+          },
+          {
+            "name": "000130",
+            "source": "paired_val",
+            "input_psnr": 17.805370330810547,
+            "pred_psnr": 17.805374145507812,
+            "delta_psnr": 3.814697265625e-06,
+            "residual_ratio": 7.248209294630215e-05
+          },
+          {
+            "name": "000208",
+            "source": "paired_val",
+            "input_psnr": 17.914222717285156,
+            "pred_psnr": 17.914222717285156,
+            "delta_psnr": 0.0,
+            "residual_ratio": 7.169153104769066e-05
+          }
+        ],
+        "synthetic_train_loss": 0.0430469810962677,
+        "synthetic_train_psnr": 23.600025296211243,
+        "synthetic_train_input_psnr": 23.600016117095947,
+        "synthetic_train_delta_psnr": 9.28342342376709e-06,
+        "synthetic_train_residual_ratio": 0.000174483442606288,
+        "synthetic_val_loss": 0.044791995896957815,
+        "synthetic_val_psnr": 23.299479484558105,
+        "synthetic_val_input_psnr": 23.299485206604004,
+        "synthetic_val_delta_psnr": -6.310641765594482e-06,
+        "synthetic_val_residual_ratio": 0.00016421593227278208,
+        "combined_train_status": "ok",
+        "combined_train_loss": 0.040362698811804876,
+        "combined_train_psnr": 25.295828700065613,
+        "combined_train_input_psnr": 25.295794665813446,
+        "combined_train_delta_psnr": 3.3836811780929565e-05,
+        "combined_train_residual_ratio": 0.00022033286859368673,
+        "combined_val_status": "ok",
+        "combined_val_loss": 0.05358171895844862,
+        "combined_val_psnr": 22.317825183868408,
+        "combined_val_input_psnr": 22.317823886871338,
+        "combined_val_delta_psnr": 9.64552164077759e-07,
+        "combined_val_residual_ratio": 0.00014017179941220093,
+        "count": 0,
+        "seconds": 152.9,
+        "selection_metric": "hrlr_val_psnr",
+        "synthetic_train_status": "ok",
+        "synthetic_val_status": "ok",
+        "selection_metric_value": 21.33617088317871
+      }
+    },
+    "paired_polish": {
+      "stage": "paired_polish",
+      "best_epoch": 1,
+      "best_metric": 21.33616195678711,
+      "best_ckpt": "/mnt/lab2-phase7-data/runs/phase7b_modal_stable_checkpointed/mixed_kernel_residual/20260408_005528/stages/paired_polish/best.pt",
+      "last_row": {
+        "epoch": 9,
+        "lr": 3.519545322482755e-05,
+        "stage": "paired_polish",
+        "model_id": "mixed_kernel_residual",
+        "loss_target": "delta_hr_minus_lr_l1",
+        "train_loss": 0.05196267428497473,
+        "train_psnr_online": 24.473909933100302,
+        "hrlr_train_loss": 0.03936510311905295,
+        "hrlr_train_psnr": 26.514153957366943,
+        "hrlr_train_input_psnr": 26.513990998268127,
+        "hrlr_train_delta_psnr": 0.00016276538372039795,
+        "hrlr_train_residual_ratio": 0.0005152951198397204,
+        "hrlr_val_loss": 0.06237161159515381,
+        "hrlr_val_psnr": 21.336181640625,
+        "hrlr_val_input_psnr": 21.336162567138672,
+        "hrlr_val_delta_psnr": 1.8157958984375e-05,
+        "hrlr_val_residual_ratio": 0.00022812535171397031,
+        "hrlr_val_hard_psnr": 19.111135203663896,
+        "hrlr_val_mid_psnr": 22.779179096221924,
+        "hrlr_val_easy_psnr": 24.809171676635742,
+        "hrlr_val_worst10": [
+          {
+            "name": "000557",
+            "source": "paired_val",
+            "input_psnr": 16.282670974731445,
+            "pred_psnr": 16.282678604125977,
+            "delta_psnr": 7.62939453125e-06,
+            "residual_ratio": 0.00011634674592642114
+          },
+          {
+            "name": "000186",
+            "source": "paired_val",
+            "input_psnr": 16.472238540649414,
+            "pred_psnr": 16.472246170043945,
+            "delta_psnr": 7.62939453125e-06,
+            "residual_ratio": 0.00011150839418405667
+          },
+          {
+            "name": "000156",
+            "source": "paired_val",
+            "input_psnr": 17.116708755493164,
+            "pred_psnr": 17.116714477539062,
+            "delta_psnr": 5.7220458984375e-06,
+            "residual_ratio": 0.0001362371986033395
+          },
+          {
+            "name": "000120",
+            "source": "paired_val",
+            "input_psnr": 17.306196212768555,
+            "pred_psnr": 17.30620765686035,
+            "delta_psnr": 1.1444091796875e-05,
+            "residual_ratio": 0.00013030356785748154
+          },
+          {
+            "name": "000210",
+            "source": "paired_val",
+            "input_psnr": 17.31226348876953,
+            "pred_psnr": 17.312265396118164,
+            "delta_psnr": 1.9073486328125e-06,
+            "residual_ratio": 0.00013027673412580043
+          },
+          {
+            "name": "000166",
+            "source": "paired_val",
+            "input_psnr": 17.417705535888672,
+            "pred_psnr": 17.417713165283203,
+            "delta_psnr": 7.62939453125e-06,
+            "residual_ratio": 0.0001376982982037589
+          },
+          {
+            "name": "00090",
+            "source": "paired_val",
+            "input_psnr": 17.519367218017578,
+            "pred_psnr": 17.519380569458008,
+            "delta_psnr": 1.33514404296875e-05,
+            "residual_ratio": 0.00013054281589575112
+          },
+          {
+            "name": "000160",
+            "source": "paired_val",
+            "input_psnr": 17.681724548339844,
+            "pred_psnr": 17.681734085083008,
+            "delta_psnr": 9.5367431640625e-06,
+            "residual_ratio": 0.00013344190665520728
+          },
+          {
+            "name": "000130",
+            "source": "paired_val",
+            "input_psnr": 17.805370330810547,
+            "pred_psnr": 17.80537986755371,
+            "delta_psnr": 9.5367431640625e-06,
+            "residual_ratio": 0.00014238501898944378
+          },
+          {
+            "name": "000208",
+            "source": "paired_val",
+            "input_psnr": 17.914222717285156,
+            "pred_psnr": 17.914226531982422,
+            "delta_psnr": 3.814697265625e-06,
+            "residual_ratio": 0.0001408317475579679
+          }
+        ],
+        "synthetic_train_loss": 0.04308845743071288,
+        "synthetic_train_psnr": 23.611652135849,
+        "synthetic_train_input_psnr": 23.611658692359924,
+        "synthetic_train_delta_psnr": -7.309019565582275e-06,
+        "synthetic_train_residual_ratio": 0.0003359875481692143,
+        "synthetic_val_loss": 0.04479292104952037,
+        "synthetic_val_psnr": 23.374891757965088,
+        "synthetic_val_input_psnr": 23.374901056289673,
+        "synthetic_val_delta_psnr": -9.104609489440918e-06,
+        "synthetic_val_residual_ratio": 0.000321260577038629,
+        "combined_train_status": "ok",
+        "combined_train_loss": 0.04122678027488291,
+        "combined_train_psnr": 25.06290304660797,
+        "combined_train_input_psnr": 25.062824845314026,
+        "combined_train_delta_psnr": 7.772818207740784e-05,
+        "combined_train_residual_ratio": 0.00042564133400446735,
+        "combined_val_status": "ok",
+        "combined_val_loss": 0.05358226632233709,
+        "combined_val_psnr": 22.355536699295044,
+        "combined_val_input_psnr": 22.355531811714172,
+        "combined_val_delta_psnr": 4.526674747467041e-06,
+        "combined_val_residual_ratio": 0.0002746929643762996,
+        "count": 0,
+        "seconds": 33.6,
+        "selection_metric": "hrlr_val_psnr",
+        "synthetic_train_status": "ok",
+        "synthetic_val_status": "ok",
+        "selection_metric_value": 21.336181640625
+      }
+    }
+  },
+  "exports": {
+    "onnx_path": "/mnt/lab2-phase7-data/runs/phase7b_modal_stable_checkpointed/mixed_kernel_residual/20260408_005528/exports/best.onnx",
+    "calibration_dir": "/mnt/lab2-phase7-data/runs/phase7b_modal_stable_checkpointed/mixed_kernel_residual/20260408_005528/exports/calibration"
+  }
+}

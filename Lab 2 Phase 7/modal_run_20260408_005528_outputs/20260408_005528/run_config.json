@@ -1,0 +1,27 @@
+{
+  "model_id": "mixed_kernel_residual",
+  "run_id": "20260408_005528",
+  "modal_environment": "",
+  "data_root": "/mnt/lab2-phase7-data/Data",
+  "run_root": "/mnt/lab2-phase7-data/runs/phase7b_modal_stable_checkpointed/mixed_kernel_residual/20260408_005528",
+  "stage_root": "/mnt/lab2-phase7-data/runs/phase7b_modal_stable_checkpointed/mixed_kernel_residual/20260408_005528/stages",
+  "export_root": "/mnt/lab2-phase7-data/runs/phase7b_modal_stable_checkpointed/mixed_kernel_residual/20260408_005528/exports",
+  "validation_root": "/mnt/lab2-phase7-data/runs/phase7b_modal_stable_checkpointed/mixed_kernel_residual/20260408_005528/validation",
+  "config": {
+    "benchmark_preset": null,
+    "batch_size": 24,
+    "train_num_workers": 8,
+    "eval_num_workers": 2,
+    "prefetch_factor": 2,
+    "dataloader_timeout_sec": 300,
+    "stage_epochs": {
+      "synthetic_warmup": 6,
+      "mixed_finetune": 24,
+      "paired_polish": 20
+    },
+    "run_synthetic_val": true,
+    "run_synthetic_train_eval": true,
+    "run_full_training": true,
+    "run_onnx_export": true
+  }
+}

@@ -1,0 +1,83 @@
+{
+  "data_root": "/mnt/lab2-phase7-data/Data",
+  "run_root": "/mnt/lab2-phase7-data/runs/phase7b_modal_stable_checkpointed/mixed_kernel_residual/20260408_005528",
+  "export_root": "/mnt/lab2-phase7-data/runs/phase7b_modal_stable_checkpointed/mixed_kernel_residual/20260408_005528/exports",
+  "validation_root": "/mnt/lab2-phase7-data/runs/phase7b_modal_stable_checkpointed/mixed_kernel_residual/20260408_005528/validation",
+  "device": "cuda",
+  "amp_policy": "bf16"
+}
+Paired train pairs: 3036 | paired val pairs: 100
+Wrote degradation profile: /mnt/lab2-phase7-data/runs/phase7b_modal_stable_checkpointed/mixed_kernel_residual/20260408_005528/degradation_profile.json
+paired_train: n=3036 | baseline_psnr mean=26.757 p10=20.048 p50=26.120 p90=34.112
+  residual mean=0.03912 | grad_ratio mean=0.631 | lap_ratio mean=0.457
+paired_val: n=100 | baseline_psnr mean=21.336 p10=17.970 p50=21.565 p90=24.072
+  residual mean=0.06237 | grad_ratio mean=0.598 | lap_ratio mean=0.449
+Profile-derived synthetic targets: {
+  "target_psnr_low": 17.969536692119192,
+  "target_psnr_center": 21.565338311938834,
+  "target_psnr_high": 24.071796771007662,
+  "target_mean_abs_residual": 0.062371243312954905,
+  "target_rgb_residual_mean": [
+    0.0014350442632712656,
+    0.001680861000513687,
+    0.0015503103228547844
+  ]
+}
+Natural records: train=18000 (COCO=12000, ImageNet=6000) | val=800
+nonorm_residual: ResidualConvSR_3x3x18 params=1,501,827 modules={'Conv2d': 20, 'PReLU': 19}
+mixed_kernel_residual: ResidualConvSR_mixed_3_3_5 params=2,386,563 modules={'Conv2d': 20, 'PReLU': 19}
+expanded_dw_large_residual: ExpandedDepthwiseResidualSR_9x9x12 params=1,057,795 modules={'Conv2d': 26, 'PReLU': 37, 'DepthwiseConv2d': 12}
+expanded_dw_large_deep: ExpandedDepthwiseResidualSR_7x7x18 params=1,435,651 modules={'Conv2d': 38, 'PReLU': 55, 'DepthwiseConv2d': 18}
+mixed_kernel_residual_wide: ResidualConvSR_wide_mixed_3_3_5 params=5,649,411 modules={'Conv2d': 26, 'PReLU': 25}
+expanded_dw_large_v2: ExpandedDepthwiseResidualSR_9x9x14_ch160 params=1,827,843 modules={'Conv2d': 30, 'PReLU': 43, 'DepthwiseConv2d': 14}
+hybrid_large_fine_residual: HybridLargeFineResidualSR params=3,495,427 modules={'Conv2d': 28, 'PReLU': 35, 'DepthwiseConv2d': 8}
+Selected model: mixed_kernel_residual / ResidualConvSR_mixed_3_3_5
+NAFNet/SimpleGate remains outside this stable notebook because CPU-fallback ops are not part of the primary stable path.
+Fresh start: synthetic_warmup
+
+epoch |       lr |    train | hrlr_val    delta | combined_val |     best |   time
+------------------------------------------------------------------------------------------------
+    1 | 1.50e-04 |   23.541 |   21.336   -0.000 |       22.463 |   21.336 |  238.1*
+    2 | 3.00e-04 |   23.541 |   21.336   -0.000 |       22.463 |   21.336 |  134.0 
+    3 | 3.00e-04 |   23.541 |   21.336   -0.000 |       22.463 |   21.336 |  126.8 
+    4 | 2.31e-04 |   23.541 |   21.336   -0.000 |       22.463 |   21.336 |  133.0 
+    5 | 9.30e-05 |   23.541 |   21.336   -0.000 |       22.463 |   21.336 |  126.3 
+    6 | 2.40e-05 |   23.541 |   21.336   -0.000 |       22.463 |   21.336 |  132.7 
+Initialized mixed_finetune from /mnt/lab2-phase7-data/runs/phase7b_modal_stable_checkpointed/mixed_kernel_residual/20260408_005528/stages/synthetic_warmup/best.pt
+Fresh start: mixed_finetune
+
+epoch |       lr |    train | hrlr_val    delta | combined_val |     best |   time
+------------------------------------------------------------------------------------------------
+    1 | 1.50e-04 |   23.818 |   21.336   -0.000 |       22.318 |   21.336 |  159.5*
+    2 | 1.50e-04 |   23.768 |   21.336    0.000 |       22.318 |   21.336 |  153.1 
+    3 | 1.49e-04 |   23.826 |   21.336    0.000 |       22.318 |   21.336 |  153.7 
+    4 | 1.47e-04 |   23.821 |   21.336    0.000 |       22.318 |   21.336 |  153.2 
+    5 | 1.44e-04 |   23.782 |   21.336    0.000 |       22.318 |   21.336 |  153.1 
+    6 | 1.39e-04 |   23.792 |   21.336    0.000 |       22.318 |   21.336 |  153.1 
+    7 | 1.33e-04 |   23.871 |   21.336    0.000 |       22.318 |   21.336 |  153.3 
+    8 | 1.25e-04 |   23.825 |   21.336    0.000 |       22.318 |   21.336 |  153.4 
+    9 | 1.17e-04 |   23.811 |   21.336    0.000 |       22.318 |   21.336 |  153.2 
+   10 | 1.08e-04 |   23.823 |   21.336    0.000 |       22.318 |   21.336 |  153.1 
+   11 | 9.88e-05 |   23.794 |   21.336    0.000 |       22.318 |   21.336 |  152.9 
+Early stopping mixed_finetune after 10 epochs without >= 0.0010 hrlr_val_psnr improvement.
+Initialized paired_polish from /mnt/lab2-phase7-data/runs/phase7b_modal_stable_checkpointed/mixed_kernel_residual/20260408_005528/stages/mixed_finetune/best.pt
+Fresh start: paired_polish
+
+epoch |       lr |    train | hrlr_val    delta | combined_val |     best |   time
+------------------------------------------------------------------------------------------------
+    1 | 5.00e-05 |   24.568 |   21.336    0.000 |       22.356 |   21.336 |   38.5*
+    2 | 5.00e-05 |   24.623 |   21.336    0.000 |       22.356 |   21.336 |   33.1 
+    3 | 4.97e-05 |   24.696 |   21.336    0.000 |       22.356 |   21.336 |   33.0 
+    4 | 4.86e-05 |   24.727 |   21.336    0.000 |       22.356 |   21.336 |   33.3 
+    5 | 4.70e-05 |   24.993 |   21.336    0.000 |       22.356 |   21.336 |   33.2 
+    6 | 4.47e-05 |   24.632 |   21.336    0.000 |       22.356 |   21.336 |   33.4 
+    7 | 4.20e-05 |   24.619 |   21.336    0.000 |       22.356 |   21.336 |   33.3 
+    8 | 3.87e-05 |   24.728 |   21.336    0.000 |       22.356 |   21.336 |   34.1 
+    9 | 3.52e-05 |   24.474 |   21.336    0.000 |       22.356 |   21.336 |   33.6 
+Early stopping paired_polish after 8 epochs without >= 0.0010 hrlr_val_psnr improvement.
+Validation helper ready. Validation outputs should be written under: /mnt/lab2-phase7-data/runs/phase7b_modal_stable_checkpointed/mixed_kernel_residual/20260408_005528/validation
+ONNX checker passed.
+ONNX Runtime parity: max_diff=0.00000006, mean_diff=0.00000000
+Exported ONNX: /mnt/lab2-phase7-data/runs/phase7b_modal_stable_checkpointed/mixed_kernel_residual/20260408_005528/exports/best.onnx (9330 KB)
+Exported calibration artifacts: /mnt/lab2-phase7-data/runs/phase7b_modal_stable_checkpointed/mixed_kernel_residual/20260408_005528/exports/calibration (128 samples)
+MXQ generation is a separate post-export step via Lab 2 Phase 5/onnx_to_mxq.py

@@ -1,0 +1,1547 @@
+# Optional dependency bootstrap. Uncomment if this runtime is missing ONNX packages.
+# %pip install -q onnx onnxruntime nbformat pillow torchvision
+
+
+from __future__ import annotations
+
+from collections import defaultdict
+from contextlib import nullcontext
+from dataclasses import dataclass
+from pathlib import Path
+from torch.utils.data import WeightedRandomSampler
+from torchvision import transforms
+from typing import Any, Callable
+import copy
+import hashlib
+import io
+import json
+import math
+import os
+import random
+import shlex
+import shutil
+import subprocess
+import tarfile
+import time
+import warnings
+import zipfile
+
+warnings.filterwarnings("ignore", message=".*legacy TorchScript-based ONNX.*")
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+from torch.optim import AdamW
+from torch.utils.data import ConcatDataset, DataLoader, Dataset, Subset
+
+try:
+    import onnx
+except ImportError:
+    onnx = None
+
+try:
+    import onnxruntime as ort
+except ImportError:
+    ort = None
+
+try:
+    import google.colab  # type: ignore
+    IN_COLAB = True
+except ImportError:
+    IN_COLAB = False
+
+TO_TENSOR = transforms.ToTensor()
+TO_PIL = transforms.ToPILImage()
+BICUBIC = Image.Resampling.BICUBIC if hasattr(Image, "Resampling") else Image.BICUBIC
+BILINEAR = Image.Resampling.BILINEAR if hasattr(Image, "Resampling") else Image.BILINEAR
+LANCZOS = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
+INTERPOLATION_BANK = {"bicubic": BICUBIC, "bilinear": BILINEAR, "lanczos": LANCZOS}
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+MOBILINT_NPU_SUPPORTED_ONNX = {
+    "AMax", "BatchNormalization", "Celu", "Conv", "DepthToSpace", "Einsum", "Elu", "Embedding",
+    "FloorDiv", "FloorMod", "Gemm", "GlobalAveragePool", "HardSigmoid", "HardSwish", "Hardtanh",
+    "Identity", "InstanceNormalization", "LeakyRelu", "MaskedFill", "Mish", "Neg", "Pad", "PRelu",
+    "MaxPool", "AveragePool", "Pow", "QuickGelu", "ReduceL2", "Repeat", "Roll", "Split", "SplitV2",
+    "Sub", "Swish", "TopK", "ConvTranspose", "Unflatten", "Upsample",
+}
+MOBILINT_CPU_FALLBACK_ONNX = {
+    "Add", "Cast", "Clip", "Concat", "Div", "Erf", "Exp", "Expand", "Flatten", "Gather", "GatherND",
+    "Gelu", "Greater", "GroupNormalization", "MatMul", "Max", "Mean", "Min", "Mul", "ReduceMax",
+    "ReduceMean", "ReduceMin", "ReduceProd", "ReduceSum", "Relu", "Reshape", "Resize", "ScatterND",
+    "Sigmoid", "Slice", "Softmax", "Softplus", "Squeeze", "Tanh", "Tile", "Transpose", "Unsqueeze", "Where",
+}
+FORBIDDEN_MODULE_TYPES = (nn.ReLU, nn.Sigmoid, nn.Softmax, nn.LayerNorm, nn.GroupNorm)
+
+
+# Configuration
+OUTPUT_SUBDIR = "phase7_calibrated_npu_sr"
+MODEL_ID = os.environ.get("LAB2_PHASE7_MODEL_ID", "nonorm_residual")  # nonorm_residual or direct_conv
+BATCH_SIZE = int(os.environ.get("LAB2_BATCH_SIZE", "16"))
+NUM_WORKERS = int(os.environ.get("LAB2_NUM_WORKERS", "2"))
+SEED = int(os.environ.get("LAB2_SEED", "255"))
+TRAIN_PATCH_SIZE = int(os.environ.get("LAB2_TRAIN_PATCH_SIZE", "224"))
+EVAL_SIZE = int(os.environ.get("LAB2_EVAL_SIZE", "256"))
+CHANNELS_LAST = os.environ.get("LAB2_CHANNELS_LAST", "1").strip().lower() not in {"0", "false", "no"}
+USE_AMP = os.environ.get("LAB2_USE_AMP", "1").strip().lower() not in {"0", "false", "no"}
+RESUME_TRAINING = os.environ.get("LAB2_RESUME_TRAINING", "1").strip().lower() not in {"0", "false", "no"}
+RUN_SMOKE_TESTS = os.environ.get("LAB2_RUN_SMOKE_TESTS", "1").strip().lower() not in {"0", "false", "no"}
+RUN_FULL_TRAINING = os.environ.get("LAB2_RUN_FULL_TRAINING", "0").strip().lower() not in {"0", "false", "no"}
+RUN_ONNX_EXPORT = os.environ.get("LAB2_RUN_ONNX_EXPORT", "1").strip().lower() not in {"0", "false", "no"}
+RUN_MXQ_DRY_RUN = os.environ.get("LAB2_RUN_MXQ_DRY_RUN", "1").strip().lower() not in {"0", "false", "no"}
+RUN_MXQ_COMPILE = os.environ.get("LAB2_RUN_MXQ_COMPILE", "0").strip().lower() not in {"0", "false", "no"}
+MAX_STEPS_PER_EPOCH = int(os.environ.get("LAB2_MAX_STEPS_PER_EPOCH", "0"))
+MAX_EVAL_BATCHES = int(os.environ.get("LAB2_MAX_EVAL_BATCHES", "0"))
+
+STAGE_EPOCH_OVERRIDES = os.environ.get("LAB2_STAGE_EPOCHS")
+if STAGE_EPOCH_OVERRIDES:
+    parts = [int(x.strip()) for x in STAGE_EPOCH_OVERRIDES.split(",") if x.strip()]
+    if len(parts) != 3:
+        raise ValueError("LAB2_STAGE_EPOCHS must be three comma-separated integers, e.g. 12,20,8")
+    STAGE_EPOCHS = {"synthetic_warmup": parts[0], "mixed_finetune": parts[1], "paired_polish": parts[2]}
+else:
+    STAGE_EPOCHS = {"synthetic_warmup": 12, "mixed_finetune": 20, "paired_polish": 8}
+
+DATA_CFG = {
+    "train_patch_size": TRAIN_PATCH_SIZE,
+    "eval_size": EVAL_SIZE,
+    "random_scale_pad": 64,
+    "imagenet_train_limit": int(os.environ.get("LAB2_IMAGENET_TRAIN_LIMIT", "6000")),
+    "imagenet_val_limit": int(os.environ.get("LAB2_IMAGENET_VAL_LIMIT", "300")),
+    "coco_train_limit": int(os.environ.get("LAB2_COCO_TRAIN_LIMIT", "12000")),
+    "coco_val_limit": int(os.environ.get("LAB2_COCO_VAL_LIMIT", "500")),
+    "train_eval_subset_size": int(os.environ.get("LAB2_TRAIN_EVAL_SUBSET_SIZE", "256")),
+    "target_psnr_low": float(os.environ.get("LAB2_TARGET_PSNR_LOW", "17.5")),
+    "target_psnr_high": float(os.environ.get("LAB2_TARGET_PSNR_HIGH", "24.8")),
+    "target_psnr_center": float(os.environ.get("LAB2_TARGET_PSNR_CENTER", "21.5")),
+    "target_grad_ratio_low": float(os.environ.get("LAB2_TARGET_GRAD_RATIO_LOW", "0.35")),
+    "target_grad_ratio_high": float(os.environ.get("LAB2_TARGET_GRAD_RATIO_HIGH", "0.85")),
+    "target_lap_ratio_low": float(os.environ.get("LAB2_TARGET_LAP_RATIO_LOW", "0.25")),
+    "target_lap_ratio_high": float(os.environ.get("LAB2_TARGET_LAP_RATIO_HIGH", "0.75")),
+    "max_degrade_attempts": int(os.environ.get("LAB2_MAX_DEGRADE_ATTEMPTS", "12")),
+    "patch_mining_candidates": int(os.environ.get("LAB2_PATCH_MINING_CANDIDATES", "8")),
+    "hard_image_threshold": float(os.environ.get("LAB2_HARD_IMAGE_THRESHOLD", "24.8")),
+    "hard_patch_weight": float(os.environ.get("LAB2_HARD_PATCH_WEIGHT", "2.0")),
+    "paired_fraction_mixed": float(os.environ.get("LAB2_PAIRED_FRACTION_MIXED", "0.65")),
+}
+
+TRAIN_CFG_BY_STAGE = {
+    "synthetic_warmup": {
+        "stage_name": "synthetic_warmup", "epochs": STAGE_EPOCHS["synthetic_warmup"], "lr": 3e-4,
+        "weight_decay": 1e-4, "warmup_epochs": 2, "min_lr_ratio": 0.08, "grad_clip_norm": 1.0,
+        "ema_decay": 0.999, "selection_metric": "paired_val_psnr", "checkpoint_interval": 4,
+        "train_eval_interval": 2, "early_stop_patience": 8, "charb_eps": 1e-6,
+    },
+    "mixed_finetune": {
+        "stage_name": "mixed_finetune", "epochs": STAGE_EPOCHS["mixed_finetune"], "lr": 1.5e-4,
+        "weight_decay": 5e-5, "warmup_epochs": 1, "min_lr_ratio": 0.05, "grad_clip_norm": 1.0,
+        "ema_decay": 0.999, "selection_metric": "paired_val_psnr", "checkpoint_interval": 4,
+        "train_eval_interval": 1, "early_stop_patience": 10, "charb_eps": 1e-6,
+    },
+    "paired_polish": {
+        "stage_name": "paired_polish", "epochs": STAGE_EPOCHS["paired_polish"], "lr": 5e-5,
+        "weight_decay": 0.0, "warmup_epochs": 1, "min_lr_ratio": 0.10, "grad_clip_norm": 0.75,
+        "ema_decay": 0.9995, "selection_metric": "paired_val_psnr", "checkpoint_interval": 2,
+        "train_eval_interval": 1, "early_stop_patience": 6, "charb_eps": 1e-6,
+    },
+}
+
+CALIBRATION_CFG = {"num_samples": int(os.environ.get("LAB2_CALIBRATION_SAMPLES", "128")), "seed": SEED, "output_subdir": "calibration"}
+
+print(json.dumps({
+    "model_id": MODEL_ID,
+    "batch_size": BATCH_SIZE,
+    "seed": SEED,
+    "stage_epochs": STAGE_EPOCHS,
+    "data_cfg": DATA_CFG,
+    "run_full_training": RUN_FULL_TRAINING,
+    "max_steps_per_epoch": MAX_STEPS_PER_EPOCH,
+    "max_eval_batches": MAX_EVAL_BATCHES,
+}, indent=2))
+
+
+# Runtime and workspace helpers
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def configure_runtime() -> torch.device:
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        try:
+            torch.set_float32_matmul_precision("high")
+        except AttributeError:
+            pass
+    elif getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    return device
+
+
+def choose_amp_policy(device: torch.device) -> dict[str, Any]:
+    if device.type != "cuda" or not USE_AMP:
+        return {"enabled": False, "dtype": None, "use_scaler": False, "label": "fp32"}
+    bf16_ok = False
+    if hasattr(torch.cuda, "is_bf16_supported"):
+        try:
+            bf16_ok = torch.cuda.is_bf16_supported()
+        except Exception:
+            bf16_ok = False
+    if bf16_ok:
+        return {"enabled": True, "dtype": torch.bfloat16, "use_scaler": False, "label": "bf16"}
+    return {"enabled": True, "dtype": torch.float16, "use_scaler": True, "label": "fp16"}
+
+
+def make_grad_scaler(amp_policy: dict[str, Any]):
+    if not amp_policy["enabled"] or not amp_policy["use_scaler"]:
+        return None
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        return torch.amp.GradScaler("cuda")
+    return torch.cuda.amp.GradScaler()
+
+
+def autocast_context(device: torch.device, amp_policy: dict[str, Any]):
+    if device.type != "cuda" or not amp_policy["enabled"]:
+        return nullcontext()
+    if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
+        return torch.amp.autocast("cuda", dtype=amp_policy["dtype"])
+    return torch.cuda.amp.autocast(dtype=amp_policy["dtype"])
+
+
+def first_existing(*paths: Path) -> Path:
+    for path in paths:
+        if path.exists():
+            return path
+    return paths[0]
+
+
+def ensure_tar_extracted(archive_path: Path, dest_root: Path) -> None:
+    if not archive_path.exists():
+        return
+    dest_root.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(archive_path, "r:*") as tf:
+        tf.extractall(dest_root)
+
+
+def ensure_unzipped(zip_path: Path, extracted_dir: Path) -> Path:
+    if extracted_dir.exists():
+        return extracted_dir
+    if not zip_path.exists():
+        return extracted_dir
+    with zipfile.ZipFile(zip_path) as zf:
+        zf.extractall(zip_path.parent)
+    return extracted_dir
+
+
+def stage_drive_data_to_local(src_root: Path, dest_root: Path) -> Path:
+    if dest_root.exists():
+        return dest_root
+    dest_root.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(src_root, dest_root)
+    return dest_root
+
+
+def resolve_workspace(output_subdir: str) -> dict[str, Path | bool]:
+    data_override = os.environ.get("LAB2_DATA_ROOT")
+    output_override = os.environ.get("LAB2_OUTPUT_DIR")
+    notebook_dir = Path.cwd().resolve()
+    repo_root = notebook_dir
+    while repo_root != repo_root.parent and not (repo_root / "Data").exists():
+        repo_root = repo_root.parent
+
+    if not IN_COLAB:
+        data_root = Path(data_override).expanduser().resolve() if data_override else repo_root / "Data"
+        output_dir = Path(output_override).expanduser().resolve() if output_override else repo_root / "Lab 2 Phase 7" / "runs" / output_subdir
+        output_dir.mkdir(parents=True, exist_ok=True)
+        return {"repo_root": repo_root, "data_root": data_root, "output_dir": output_dir, "workspace_root": repo_root, "in_colab": False}
+
+    from google.colab import drive  # type: ignore
+
+    drive.mount("/content/drive", force_remount=False)
+    mydrive_root = Path("/content/drive/MyDrive")
+    course_lab_root = first_existing(
+        mydrive_root / "Data 255 Class Spring 2026" / "Lab 2",
+        mydrive_root / "Data 255 Spring 2026" / "Lab 2",
+    )
+    fallback_sync_root = first_existing(
+        mydrive_root / "Lab-2-colab",
+        mydrive_root / "Colab Notebooks" / "Lab-2-colab",
+    )
+    sync_root = course_lab_root if course_lab_root.exists() else fallback_sync_root
+    sync_root.mkdir(parents=True, exist_ok=True)
+    project_root = Path(f"/content/{output_subdir}_workspace")
+    local_data_root = project_root / "Data"
+    if not local_data_root.exists():
+        archive = first_existing(sync_root / "lab2_phase7_data.tar", sync_root / "lab2_phase5_data.tar", sync_root / "lab2_colab_data.tar")
+        drive_data_root = sync_root / "Data"
+        if archive.exists():
+            ensure_tar_extracted(archive, project_root)
+        elif drive_data_root.exists():
+            stage_drive_data_to_local(drive_data_root, local_data_root)
+        else:
+            raise FileNotFoundError(f"Missing data for Colab. Expected Data or data tarball under {sync_root}")
+    data_root = Path(data_override).expanduser().resolve() if data_override else local_data_root
+    output_dir = Path(output_override).expanduser().resolve() if output_override else sync_root / "runs" / output_subdir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return {"repo_root": sync_root, "data_root": data_root, "output_dir": output_dir, "workspace_root": project_root, "in_colab": True}
+
+
+def slugify_name(text: str) -> str:
+    cleaned = "".join(ch if ch.isalnum() else "_" for ch in str(text))
+    return "_".join(part for part in cleaned.split("_") if part)[:96] or "sample"
+
+
+set_seed(SEED)
+device = configure_runtime()
+amp_policy = choose_amp_policy(device)
+channels_last = bool(CHANNELS_LAST and device.type == "cuda")
+workspace = resolve_workspace(OUTPUT_SUBDIR)
+OUTPUT_DIR = Path(workspace["output_dir"])
+DATA_ROOT = Path(workspace["data_root"])
+print(f"Device: {device} | AMP: {amp_policy['label']} | channels_last={channels_last}")
+print(f"Data root: {DATA_ROOT}")
+print(f"Output dir: {OUTPUT_DIR}")
+
+
+# Data discovery and degradation metrics
+def collect_paired_by_subfolder(lr_root: Path, hr_root: Path) -> list[tuple[Path, Path, str]]:
+    pairs: list[tuple[Path, Path, str]] = []
+    if not lr_root.exists() or not hr_root.exists():
+        return pairs
+    for hr_dir in sorted(p for p in hr_root.iterdir() if p.is_dir()):
+        suffix = hr_dir.name.replace("HR_train", "")
+        lr_dir = lr_root / f"LR_train{suffix}"
+        if not lr_dir.exists():
+            continue
+        hr_imgs = {p.stem: p for p in sorted(hr_dir.glob("*.png"))}
+        lr_imgs = {p.stem: p for p in sorted(lr_dir.glob("*.png"))}
+        pairs.extend((lr_imgs[s], hr_imgs[s], f"{hr_dir.name}/{s}") for s in sorted(set(hr_imgs) & set(lr_imgs)))
+    return pairs
+
+
+def collect_paired_flat(lr_dir: Path, hr_dir: Path) -> list[tuple[Path, Path, str]]:
+    if not lr_dir.exists() or not hr_dir.exists():
+        return []
+    hr_imgs = {p.stem: p for p in sorted(hr_dir.glob("*.png"))}
+    lr_imgs = {p.stem: p for p in sorted(lr_dir.glob("*.png"))}
+    return [(lr_imgs[s], hr_imgs[s], s) for s in sorted(set(hr_imgs) & set(lr_imgs))]
+
+
+def collect_train_pairs(data_root: Path) -> list[tuple[Path, Path, str]]:
+    structured = collect_paired_by_subfolder(data_root / "LR_train", data_root / "HR_train")
+    if structured:
+        return structured
+    return collect_paired_flat(data_root / "train" / "LR", data_root / "train" / "HR")
+
+
+def collect_val_pairs(data_root: Path) -> list[tuple[Path, Path, str]]:
+    for lr_dir, hr_dir in [
+        (data_root / "LR_val", data_root / "HR_val"),
+        (data_root / "val" / "LR_val", data_root / "val" / "HR_val"),
+        (data_root / "val" / "LR", data_root / "val" / "HR"),
+    ]:
+        pairs = collect_paired_flat(lr_dir, hr_dir)
+        if pairs:
+            return pairs
+    return []
+
+
+def pil_rgb(path: Path) -> Image.Image:
+    return Image.open(path).convert("RGB")
+
+
+def tensor_psnr(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    mse = torch.mean((a.float().clamp(0, 1) - b.float().clamp(0, 1)) ** 2, dim=(-3, -2, -1)).clamp_min(1e-12)
+    return -10.0 * torch.log10(mse)
+
+
+def pil_to_np(img: Image.Image) -> np.ndarray:
+    return np.asarray(img.convert("RGB"), dtype=np.float32) / 255.0
+
+
+def np_psnr(a: np.ndarray, b: np.ndarray) -> float:
+    mse = float(np.mean((a - b) ** 2))
+    return -10.0 * math.log10(max(mse, 1e-12))
+
+
+def gray_np(a: np.ndarray) -> np.ndarray:
+    return 0.299 * a[:, :, 0] + 0.587 * a[:, :, 1] + 0.114 * a[:, :, 2]
+
+
+def grad_energy_np(a: np.ndarray) -> float:
+    g = gray_np(a)
+    return float(0.5 * (np.abs(g[:, 1:] - g[:, :-1]).mean() + np.abs(g[1:, :] - g[:-1, :]).mean()))
+
+
+def lap_energy_np(a: np.ndarray) -> float:
+    g = gray_np(a)
+    lap = -4 * g[1:-1, 1:-1] + g[:-2, 1:-1] + g[2:, 1:-1] + g[1:-1, :-2] + g[1:-1, 2:]
+    return float(np.abs(lap).mean())
+
+
+def pair_metric_row(lr_img: Image.Image, hr_img: Image.Image, name: str, source: str) -> dict[str, Any]:
+    lr = pil_to_np(lr_img)
+    hr = pil_to_np(hr_img)
+    residual = hr - lr
+    lr_grad, hr_grad = grad_energy_np(lr), grad_energy_np(hr)
+    lr_lap, hr_lap = lap_energy_np(lr), lap_energy_np(hr)
+    return {
+        "name": name,
+        "source": source,
+        "baseline_psnr": np_psnr(lr, hr),
+        "mean_abs_residual": float(np.mean(np.abs(residual))),
+        "signed_residual_mean_rgb": [float(x) for x in np.mean(residual, axis=(0, 1))],
+        "lr_grad_energy": lr_grad,
+        "hr_grad_energy": hr_grad,
+        "grad_ratio": lr_grad / max(hr_grad, 1e-12),
+        "lr_lap_energy": lr_lap,
+        "hr_lap_energy": hr_lap,
+        "lap_ratio": lr_lap / max(hr_lap, 1e-12),
+    }
+
+
+def summarize_numeric(rows: list[dict[str, Any]], keys: list[str]) -> dict[str, Any]:
+    summary: dict[str, Any] = {"count": len(rows)}
+    for key in keys:
+        vals = sorted(float(row[key]) for row in rows if key in row)
+        if not vals:
+            continue
+        def quantile(q: float) -> float:
+            return vals[min(len(vals) - 1, max(0, round(q * (len(vals) - 1))))]
+        summary[key] = {
+            "mean": float(np.mean(vals)),
+            "std": float(np.std(vals)),
+            "p10": quantile(0.10),
+            "p25": quantile(0.25),
+            "p50": quantile(0.50),
+            "p75": quantile(0.75),
+            "p90": quantile(0.90),
+            "min": vals[0],
+            "max": vals[-1],
+        }
+    return summary
+
+
+def build_degradation_profile(train_pairs: list[tuple[Path, Path, str]], val_pairs: list[tuple[Path, Path, str]], output_dir: Path) -> dict[str, Any]:
+    rows_by_split: dict[str, list[dict[str, Any]]] = {}
+    for split, pairs in {"paired_train": train_pairs, "paired_val": val_pairs}.items():
+        rows = []
+        for lr_path, hr_path, name in pairs:
+            rows.append(pair_metric_row(pil_rgb(lr_path), pil_rgb(hr_path), name=name, source=split))
+        rows_by_split[split] = rows
+
+    keys = ["baseline_psnr", "mean_abs_residual", "grad_ratio", "lap_ratio", "lr_grad_energy", "hr_grad_energy", "lr_lap_energy", "hr_lap_energy"]
+    profile = {
+        "created_at_unix": time.time(),
+        "config": {
+            "target_psnr_low": DATA_CFG["target_psnr_low"],
+            "target_psnr_high": DATA_CFG["target_psnr_high"],
+            "target_psnr_center": DATA_CFG["target_psnr_center"],
+        },
+        "summaries": {split: summarize_numeric(rows, keys) for split, rows in rows_by_split.items()},
+        "paired_train_rows": rows_by_split["paired_train"],
+        "paired_val_rows": rows_by_split["paired_val"],
+    }
+    output_path = output_dir / "degradation_profile.json"
+    output_path.write_text(json.dumps(profile, indent=2))
+    print(f"Wrote degradation profile: {output_path}")
+    for split in ["paired_train", "paired_val"]:
+        s = profile["summaries"][split]
+        print(f"{split}: n={s['count']} | baseline_psnr mean={s['baseline_psnr']['mean']:.3f} p10={s['baseline_psnr']['p10']:.3f} p50={s['baseline_psnr']['p50']:.3f} p90={s['baseline_psnr']['p90']:.3f}")
+        print(f"  residual mean={s['mean_abs_residual']['mean']:.5f} | grad_ratio mean={s['grad_ratio']['mean']:.3f} | lap_ratio mean={s['lap_ratio']['mean']:.3f}")
+    return profile
+
+
+train_pairs = collect_train_pairs(DATA_ROOT)
+val_pairs = collect_val_pairs(DATA_ROOT)
+if not train_pairs:
+    raise FileNotFoundError(f"No paired training images found under {DATA_ROOT}")
+if not val_pairs:
+    raise FileNotFoundError(f"No paired validation images found under {DATA_ROOT}")
+print(f"Paired train pairs: {len(train_pairs)} | paired val pairs: {len(val_pairs)}")
+degradation_profile = build_degradation_profile(train_pairs, val_pairs, OUTPUT_DIR)
+
+
+# Natural image manifests and calibrated degradation
+def read_manifest_lines(path: Path) -> list[str]:
+    if not path.exists():
+        return []
+    return [line.strip() for line in path.read_text().splitlines() if line.strip()]
+
+
+def read_imagenet_manifest(path: Path) -> list[tuple[str, int]]:
+    if not path.exists():
+        return []
+    rows = []
+    for line in path.read_text().splitlines():
+        parts = line.split()
+        if len(parts) >= 2:
+            rows.append((parts[0], int(parts[1])))
+    return rows
+
+
+def collect_imagenet_records(data_root: Path, split: str) -> list[dict[str, Any]]:
+    course = data_root / "course_files_export"
+    legacy = data_root / "ImageNet"
+    if split == "train":
+        list_path = first_existing(course / "imagenet_train20.txt", legacy / "imagenet_train20.txt")
+        image_root = ensure_unzipped(course / "imagenet_train20.zip", first_existing(course / "imagenet_train20a", legacy / "imagenet_train20a"))
+    else:
+        list_path = first_existing(course / "imagenet_val20.txt", legacy / "imagenet_val20.txt")
+        image_root = ensure_unzipped(course / "imagenet_val20.zip", first_existing(course / "imagenet_val20", legacy / "imagenet_val20"))
+    records: list[dict[str, Any]] = []
+    for filename, class_id in read_imagenet_manifest(list_path):
+        synset = filename.split("_")[0]
+        path = (image_root / synset / filename) if split == "train" else (image_root / filename)
+        if path.exists():
+            records.append({"path": path, "stem": path.stem, "source_name": f"imagenet_{split}", "class_id": class_id})
+    return records
+
+
+def coco_root(data_root: Path) -> Path:
+    return data_root / "course_files_export" / "coco2017"
+
+
+def collect_coco_records(data_root: Path, split: str) -> list[dict[str, Any]]:
+    root = coco_root(data_root)
+    manifest = root / f"coco_{split}2017.txt"
+    image_dir = root / f"{split}2017"
+    if not manifest.exists() and image_dir.exists():
+        rels = [str(p.relative_to(root)) for p in sorted(image_dir.rglob("*")) if p.suffix.lower() in IMAGE_SUFFIXES]
+        manifest.write_text("\n".join(rels) + ("\n" if rels else ""))
+    records = []
+    for rel in read_manifest_lines(manifest):
+        path = root / rel
+        if path.exists():
+            records.append({"path": path, "stem": path.stem, "source_name": f"coco_{split}"})
+    return records
+
+
+def take_subset(records: list[Any], limit: int | None, seed: int) -> list[Any]:
+    if limit is None or limit >= len(records):
+        return list(records)
+    rng = random.Random(seed)
+    items = list(records)
+    rng.shuffle(items)
+    return items[:limit]
+
+
+def build_natural_records(data_root: Path, data_cfg: dict[str, Any], seed: int) -> dict[str, list[dict[str, Any]]]:
+    imagenet_train = take_subset(collect_imagenet_records(data_root, "train"), data_cfg["imagenet_train_limit"], seed)
+    imagenet_val = take_subset(collect_imagenet_records(data_root, "val"), data_cfg["imagenet_val_limit"], seed)
+    coco_train = take_subset(collect_coco_records(data_root, "train"), data_cfg["coco_train_limit"], seed + 17)
+    coco_val = take_subset(collect_coco_records(data_root, "val"), data_cfg["coco_val_limit"], seed + 17)
+    train = coco_train + imagenet_train
+    val = coco_val + imagenet_val
+    if not train:
+        raise FileNotFoundError("No COCO/ImageNet natural images found for calibrated synthetic training.")
+    print(f"Natural records: train={len(train)} (COCO={len(coco_train)}, ImageNet={len(imagenet_train)}) | val={len(val)}")
+    return {"train": train, "val": val, "coco_train": coco_train, "imagenet_train": imagenet_train, "coco_val": coco_val, "imagenet_val": imagenet_val}
+
+
+def seeded_rng(key: str) -> random.Random:
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    return random.Random(int(digest[:16], 16))
+
+
+def random_crop_single(img: Image.Image, size: int, rng: random.Random) -> Image.Image:
+    if img.width < size or img.height < size:
+        img = ImageOps.fit(img, (size, size), method=BICUBIC)
+    if img.width == size and img.height == size:
+        return img
+    x0 = rng.randint(0, img.width - size)
+    y0 = rng.randint(0, img.height - size)
+    return img.crop((x0, y0, x0 + size, y0 + size))
+
+
+def random_crop_pair(lr_img: Image.Image, hr_img: Image.Image, size: int, rng: random.Random) -> tuple[Image.Image, Image.Image]:
+    if lr_img.width < size or lr_img.height < size:
+        lr_img = ImageOps.fit(lr_img, (size, size), method=BICUBIC)
+        hr_img = ImageOps.fit(hr_img, (size, size), method=BICUBIC)
+    if lr_img.width == size and lr_img.height == size:
+        return lr_img, hr_img
+    x0 = rng.randint(0, lr_img.width - size)
+    y0 = rng.randint(0, lr_img.height - size)
+    box = (x0, y0, x0 + size, y0 + size)
+    return lr_img.crop(box), hr_img.crop(box)
+
+
+def hard_mine_crop_pair(lr_img: Image.Image, hr_img: Image.Image, size: int, rng: random.Random, candidates: int) -> tuple[Image.Image, Image.Image]:
+    if candidates <= 1 or lr_img.width <= size or lr_img.height <= size:
+        return random_crop_pair(lr_img, hr_img, size, rng)
+    best: tuple[float, tuple[int, int]] | None = None
+    lr_np_full = pil_to_np(lr_img)
+    hr_np_full = pil_to_np(hr_img)
+    for _ in range(candidates):
+        x0 = rng.randint(0, lr_img.width - size)
+        y0 = rng.randint(0, lr_img.height - size)
+        score = np_psnr(lr_np_full[y0:y0 + size, x0:x0 + size], hr_np_full[y0:y0 + size, x0:x0 + size])
+        if best is None or score < best[0]:
+            best = (score, (x0, y0))
+    assert best is not None
+    x0, y0 = best[1]
+    box = (x0, y0, x0 + size, y0 + size)
+    return lr_img.crop(box), hr_img.crop(box)
+
+
+def augment_pair(lr_img: Image.Image, hr_img: Image.Image, rng: random.Random) -> tuple[Image.Image, Image.Image]:
+    if rng.random() > 0.5:
+        lr_img = lr_img.transpose(Image.FLIP_LEFT_RIGHT)
+        hr_img = hr_img.transpose(Image.FLIP_LEFT_RIGHT)
+    if rng.random() > 0.5:
+        lr_img = lr_img.transpose(Image.FLIP_TOP_BOTTOM)
+        hr_img = hr_img.transpose(Image.FLIP_TOP_BOTTOM)
+    k = rng.randint(0, 3)
+    if k:
+        op = {1: Image.ROTATE_90, 2: Image.ROTATE_180, 3: Image.ROTATE_270}[k]
+        lr_img = lr_img.transpose(op)
+        hr_img = hr_img.transpose(op)
+    return lr_img, hr_img
+
+
+def augment_single(img: Image.Image, rng: random.Random) -> Image.Image:
+    if rng.random() > 0.5:
+        img = img.transpose(Image.FLIP_LEFT_RIGHT)
+    if rng.random() > 0.5:
+        img = img.transpose(Image.FLIP_TOP_BOTTOM)
+    k = rng.randint(0, 3)
+    if k:
+        img = img.transpose({1: Image.ROTATE_90, 2: Image.ROTATE_180, 3: Image.ROTATE_270}[k])
+    return img
+
+
+def jpeg_roundtrip(img: Image.Image, quality: int) -> Image.Image:
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=quality)
+    buf.seek(0)
+    return Image.open(buf).convert("RGB")
+
+
+def apply_rgb_gamma_shift(img: Image.Image, rng: random.Random) -> Image.Image:
+    arr = pil_to_np(img)
+    # Mild camera/ISP-like shifts. Keep subtle; rejection sampling controls final severity.
+    gains = np.array([rng.uniform(0.97, 1.03), rng.uniform(0.97, 1.03), rng.uniform(0.97, 1.03)], dtype=np.float32)
+    bias = np.array([rng.uniform(-0.008, 0.008), rng.uniform(-0.008, 0.008), rng.uniform(-0.008, 0.008)], dtype=np.float32)
+    gamma = rng.uniform(0.94, 1.06)
+    arr = np.clip(arr * gains + bias, 0.0, 1.0)
+    arr = np.clip(arr, 0.0, 1.0) ** gamma
+    return Image.fromarray(np.uint8(np.clip(arr, 0.0, 1.0) * 255.0 + 0.5), mode="RGB")
+
+
+def generate_degraded_candidate(hr_img: Image.Image, rng: random.Random) -> tuple[Image.Image, dict[str, Any]]:
+    lr_img = hr_img.copy()
+    params: dict[str, Any] = {}
+    if rng.random() < 0.92:
+        radius = rng.uniform(0.35, 2.20)
+        lr_img = lr_img.filter(ImageFilter.GaussianBlur(radius=radius))
+        params["blur_radius"] = radius
+    scale = rng.choice([2, 3, 4, 5])
+    down_mode = rng.choice([BICUBIC, BILINEAR, LANCZOS])
+    up_mode = rng.choice([BICUBIC, BILINEAR])
+    small = (max(1, hr_img.width // scale), max(1, hr_img.height // scale))
+    lr_img = lr_img.resize(small, resample=down_mode).resize(hr_img.size, resample=up_mode)
+    params["scale"] = scale
+    if rng.random() < 0.70:
+        quality = rng.randint(20, 88)
+        lr_img = jpeg_roundtrip(lr_img, quality)
+        params["jpeg_quality"] = quality
+    if rng.random() < 0.55:
+        lr_img = apply_rgb_gamma_shift(lr_img, rng)
+        params["rgb_gamma_shift"] = True
+    if rng.random() < 0.55:
+        arr = pil_to_np(lr_img)
+        sigma = rng.uniform(0.002, 0.020)
+        arr = np.clip(arr + rng.normalvariate(0, sigma) * np.ones_like(arr) + np.random.default_rng(rng.randint(0, 2**32 - 1)).normal(0.0, sigma, size=arr.shape), 0.0, 1.0)
+        lr_img = Image.fromarray(np.uint8(arr * 255.0 + 0.5), mode="RGB")
+        params["noise_sigma"] = sigma
+    return lr_img, params
+
+
+def degradation_score(row: dict[str, Any], cfg: dict[str, Any]) -> float:
+    psnr_penalty = abs(row["baseline_psnr"] - cfg["target_psnr_center"])
+    grad_center = 0.5 * (cfg["target_grad_ratio_low"] + cfg["target_grad_ratio_high"])
+    lap_center = 0.5 * (cfg["target_lap_ratio_low"] + cfg["target_lap_ratio_high"])
+    grad_penalty = 4.0 * abs(row["grad_ratio"] - grad_center)
+    lap_penalty = 3.0 * abs(row["lap_ratio"] - lap_center)
+    return psnr_penalty + grad_penalty + lap_penalty
+
+
+def row_matches_target(row: dict[str, Any], cfg: dict[str, Any]) -> bool:
+    return (
+        cfg["target_psnr_low"] <= row["baseline_psnr"] <= cfg["target_psnr_high"]
+        and cfg["target_grad_ratio_low"] <= row["grad_ratio"] <= cfg["target_grad_ratio_high"]
+        and cfg["target_lap_ratio_low"] <= row["lap_ratio"] <= cfg["target_lap_ratio_high"]
+    )
+
+
+def calibrated_degrade_from_hr(hr_img: Image.Image, rng: random.Random, cfg: dict[str, Any]) -> tuple[Image.Image, dict[str, Any]]:
+    best: tuple[float, Image.Image, dict[str, Any]] | None = None
+    for attempt in range(cfg["max_degrade_attempts"]):
+        candidate, params = generate_degraded_candidate(hr_img, rng)
+        row = pair_metric_row(candidate, hr_img, name="synthetic", source="synthetic")
+        params = {**params, **{k: row[k] for k in ["baseline_psnr", "mean_abs_residual", "grad_ratio", "lap_ratio"]}, "attempt": attempt + 1}
+        score = degradation_score(row, cfg)
+        if best is None or score < best[0]:
+            best = (score, candidate, params)
+        if row_matches_target(row, cfg):
+            params["accepted"] = True
+            return candidate, params
+    assert best is not None
+    best[2]["accepted"] = False
+    return best[1], best[2]
+
+
+natural_records = build_natural_records(DATA_ROOT, DATA_CFG, SEED)
+
+
+# Dataset and loader construction
+class PairedSRDataset(Dataset):
+    def __init__(self, pairs: list[tuple[Path, Path, str]], train: bool, data_cfg: dict[str, Any], seed: int, source_name: str = "paired_train", hard_mine: bool = False):
+        self.pairs = pairs
+        self.train = train
+        self.data_cfg = data_cfg
+        self.seed = seed
+        self.source_name = source_name
+        self.hard_mine = hard_mine
+
+    def __len__(self):
+        return len(self.pairs)
+
+    def __getitem__(self, idx: int):
+        lr_path, hr_path, name = self.pairs[idx]
+        lr_img, hr_img = pil_rgb(lr_path), pil_rgb(hr_path)
+        rng = random.Random(self.seed + idx + (100_000 if self.hard_mine else 0)) if self.train else seeded_rng(f"{self.source_name}:{name}")
+        if self.train:
+            if self.hard_mine:
+                lr_img, hr_img = hard_mine_crop_pair(lr_img, hr_img, self.data_cfg["train_patch_size"], rng, self.data_cfg["patch_mining_candidates"])
+            else:
+                lr_img, hr_img = random_crop_pair(lr_img, hr_img, self.data_cfg["train_patch_size"], rng)
+            lr_img, hr_img = augment_pair(lr_img, hr_img, rng)
+        else:
+            lr_img = ImageOps.fit(lr_img, (self.data_cfg["eval_size"], self.data_cfg["eval_size"]), method=BICUBIC)
+            hr_img = ImageOps.fit(hr_img, (self.data_cfg["eval_size"], self.data_cfg["eval_size"]), method=BICUBIC)
+        return TO_TENSOR(lr_img), TO_TENSOR(hr_img), name, self.source_name
+
+
+class CalibratedSyntheticSRDataset(Dataset):
+    def __init__(self, records: list[dict[str, Any]], train: bool, data_cfg: dict[str, Any], seed: int, source_name: str = "calibrated_synthetic"):
+        self.records = records
+        self.train = train
+        self.data_cfg = data_cfg
+        self.seed = seed
+        self.source_name = source_name
+        self.last_params: list[dict[str, Any]] = []
+
+    def __len__(self):
+        return len(self.records)
+
+    def __getitem__(self, idx: int):
+        record = self.records[idx]
+        hr_img = pil_rgb(record["path"])
+        rng = random.Random(self.seed + idx) if self.train else seeded_rng(f"{self.source_name}:{record['stem']}")
+        if self.train:
+            base_size = max(self.data_cfg["eval_size"], self.data_cfg["train_patch_size"] + self.data_cfg["random_scale_pad"])
+            hr_img = ImageOps.fit(hr_img, (base_size, base_size), method=BICUBIC)
+            hr_img = random_crop_single(hr_img, self.data_cfg["train_patch_size"], rng)
+            hr_img = augment_single(hr_img, rng)
+        else:
+            hr_img = ImageOps.fit(hr_img, (self.data_cfg["eval_size"], self.data_cfg["eval_size"]), method=BICUBIC)
+        lr_img, params = calibrated_degrade_from_hr(hr_img, rng, self.data_cfg)
+        if self.train and len(self.last_params) < 2048:
+            self.last_params.append(params)
+        return TO_TENSOR(lr_img), TO_TENSOR(hr_img), record["stem"], self.source_name
+
+
+def loader_kwargs(num_workers: int, pin_memory: bool) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {"num_workers": num_workers, "pin_memory": pin_memory}
+    if num_workers > 0:
+        kwargs["persistent_workers"] = True
+        kwargs["prefetch_factor"] = 4
+    return kwargs
+
+
+def make_fixed_subset_loader(dataset: Dataset, subset_size: int, batch_size: int, seed: int, num_workers: int, pin_memory: bool) -> DataLoader:
+    subset_size = min(subset_size, len(dataset))
+    rng = random.Random(seed)
+    indices = list(range(len(dataset)))
+    rng.shuffle(indices)
+    subset = Subset(dataset, indices[:subset_size])
+    return DataLoader(subset, batch_size=batch_size, shuffle=False, **loader_kwargs(num_workers, pin_memory))
+
+
+def paired_image_weights(train_rows: list[dict[str, Any]], threshold: float, hard_weight: float) -> list[float]:
+    rows_by_name = {row["name"]: row for row in train_rows}
+    weights = []
+    for _, _, name in train_pairs:
+        psnr = rows_by_name.get(name, {}).get("baseline_psnr", threshold)
+        # Continuous hard weighting. Harder examples receive more probability mass.
+        weights.append(1.0 + hard_weight * max(0.0, threshold - float(psnr)) / max(1.0, threshold - DATA_CFG["target_psnr_low"]))
+    return weights
+
+
+def make_stage_datasets(stage_name: str, seed: int) -> dict[str, Dataset]:
+    paired_train = PairedSRDataset(train_pairs, train=True, data_cfg=DATA_CFG, seed=seed, source_name="paired_train", hard_mine=stage_name != "synthetic_warmup")
+    paired_train_eval = PairedSRDataset(train_pairs, train=False, data_cfg=DATA_CFG, seed=seed, source_name="paired_train")
+    paired_val = PairedSRDataset(val_pairs, train=False, data_cfg=DATA_CFG, seed=seed, source_name="paired_val")
+    synthetic_train = CalibratedSyntheticSRDataset(natural_records["train"], train=True, data_cfg=DATA_CFG, seed=seed, source_name="calibrated_synthetic")
+    synthetic_val = CalibratedSyntheticSRDataset(natural_records["val"], train=False, data_cfg=DATA_CFG, seed=seed, source_name="calibrated_synthetic_val") if natural_records["val"] else synthetic_train
+
+    if stage_name == "synthetic_warmup":
+        train_dataset: Dataset = synthetic_train
+        sampler = None
+    elif stage_name == "mixed_finetune":
+        train_dataset = ConcatDataset([paired_train, synthetic_train])
+        paired_weights = paired_image_weights(degradation_profile["paired_train_rows"], DATA_CFG["hard_image_threshold"], DATA_CFG["hard_patch_weight"])
+        synthetic_weight = max(0.05, (1.0 - DATA_CFG["paired_fraction_mixed"]) / max(DATA_CFG["paired_fraction_mixed"], 1e-6))
+        weights = paired_weights + [synthetic_weight for _ in range(len(synthetic_train))]
+        sampler = WeightedRandomSampler(weights, num_samples=max(len(train_dataset), len(paired_train) * 2), replacement=True)
+    elif stage_name == "paired_polish":
+        train_dataset = paired_train
+        weights = paired_image_weights(degradation_profile["paired_train_rows"], DATA_CFG["hard_image_threshold"], DATA_CFG["hard_patch_weight"])
+        sampler = WeightedRandomSampler(weights, num_samples=len(paired_train), replacement=True)
+    else:
+        raise ValueError(f"Unknown stage: {stage_name}")
+
+    return {
+        "train": train_dataset,
+        "train_sampler": sampler,
+        "train_eval": paired_train_eval,
+        "paired_val": paired_val,
+        "synthetic_val": synthetic_val,
+        "calibration": ConcatDataset([paired_train_eval, synthetic_val]) if len(natural_records["val"]) else paired_train_eval,
+    }
+
+
+def make_stage_loaders(stage_name: str, seed: int) -> dict[str, Any]:
+    datasets = make_stage_datasets(stage_name, seed)
+    pin_memory = device.type == "cuda"
+    train_loader = DataLoader(
+        datasets["train"],
+        batch_size=BATCH_SIZE,
+        shuffle=datasets["train_sampler"] is None,
+        sampler=datasets["train_sampler"],
+        drop_last=True,
+        **loader_kwargs(NUM_WORKERS, pin_memory),
+    )
+    return {
+        **datasets,
+        "train_loader": train_loader,
+        "train_eval_loader": make_fixed_subset_loader(datasets["train_eval"], DATA_CFG["train_eval_subset_size"], BATCH_SIZE, seed, NUM_WORKERS, pin_memory),
+        "paired_val_loader": DataLoader(datasets["paired_val"], batch_size=BATCH_SIZE, shuffle=False, **loader_kwargs(NUM_WORKERS, pin_memory)),
+        "synthetic_val_loader": make_fixed_subset_loader(datasets["synthetic_val"], min(DATA_CFG["train_eval_subset_size"], len(datasets["synthetic_val"])), BATCH_SIZE, seed, NUM_WORKERS, pin_memory),
+        "calibration_loader": DataLoader(datasets["calibration"], batch_size=1, shuffle=False, **loader_kwargs(0, False)),
+    }
+
+
+smoke_loaders = make_stage_loaders("synthetic_warmup", SEED)
+smoke_batch = next(iter(smoke_loaders["train_loader"]))
+print(f"Stage synthetic_warmup train size={len(smoke_loaders['train'])}; batch LR={tuple(smoke_batch[0].shape)} HR={tuple(smoke_batch[1].shape)}")
+
+
+# Models and NPU/module checks
+class ConvPReLUBlock(nn.Module):
+    def __init__(self, channels: int, kernel_size: int = 3):
+        super().__init__()
+        padding = kernel_size // 2
+        self.conv = nn.Conv2d(channels, channels, kernel_size, padding=padding, bias=True)
+        self.act = nn.PReLU(num_parameters=channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.act(self.conv(x))
+
+
+class Phase7NoNormResidualConvSR(nn.Module):
+    def __init__(self, channels: int = 96, num_blocks: int = 18, kernel_size: int = 3):
+        super().__init__()
+        self.stem = nn.Sequential(nn.Conv2d(3, channels, 3, padding=1, bias=True), nn.PReLU(num_parameters=channels))
+        self.body = nn.Sequential(*[ConvPReLUBlock(channels, kernel_size=kernel_size) for _ in range(num_blocks)])
+        self.tail = nn.Conv2d(channels, 3, 3, padding=1, bias=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.tail(self.body(self.stem(x)))
+
+
+class Phase7DirectConvSR(nn.Module):
+    def __init__(self, channels: int = 96, num_blocks: int = 18, kernel_size: int = 3):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(3, channels, 3, padding=1, bias=True),
+            nn.PReLU(num_parameters=channels),
+            *[ConvPReLUBlock(channels, kernel_size=kernel_size) for _ in range(num_blocks)],
+            nn.Conv2d(channels, 3, 3, padding=1, bias=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+MODEL_REGISTRY = {
+    "nonorm_residual": {
+        "display_name": "Phase7NoNormResidualConvSR",
+        "build_model": lambda **cfg: Phase7NoNormResidualConvSR(**cfg),
+        "model_cfg": {"channels": 96, "num_blocks": 18, "kernel_size": 3},
+    },
+    "direct_conv": {
+        "display_name": "Phase7DirectConvSR",
+        "build_model": lambda **cfg: Phase7DirectConvSR(**cfg),
+        "model_cfg": {"channels": 96, "num_blocks": 18, "kernel_size": 3},
+    },
+}
+
+
+def count_parameters(model: nn.Module) -> int:
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def assert_module_compatible(model: nn.Module) -> None:
+    for name, module in model.named_modules():
+        if isinstance(module, FORBIDDEN_MODULE_TYPES):
+            raise TypeError(f"Forbidden module for Mobilint path at {name}: {module.__class__.__name__}")
+        if isinstance(module, (nn.BatchNorm2d, nn.Dropout, nn.Dropout2d, nn.AdaptiveAvgPool2d, nn.Sigmoid, nn.Hardsigmoid)):
+            raise TypeError(f"Phase 7 model should avoid normalization/attention/dropout at {name}: {module.__class__.__name__}")
+
+
+def summarize_model_modules(model: nn.Module) -> dict[str, int]:
+    counts: dict[str, int] = defaultdict(int)
+    for module in model.modules():
+        if isinstance(module, nn.Conv2d):
+            counts["Conv2d"] += 1
+        elif isinstance(module, nn.PReLU):
+            counts["PReLU"] += 1
+    return dict(counts)
+
+
+def get_model_spec(model_id: str) -> dict[str, Any]:
+    if model_id not in MODEL_REGISTRY:
+        raise KeyError(f"Unknown MODEL_ID={model_id}; choose {sorted(MODEL_REGISTRY)}")
+    spec = copy.deepcopy(MODEL_REGISTRY[model_id])
+    probe = spec["build_model"](**spec["model_cfg"])
+    assert_module_compatible(probe)
+    spec["params"] = count_parameters(probe)
+    spec["module_ops"] = summarize_model_modules(probe)
+    return spec
+
+
+for model_id in MODEL_REGISTRY:
+    spec = get_model_spec(model_id)
+    probe = spec["build_model"](**spec["model_cfg"])
+    with torch.no_grad():
+        out = probe(torch.randn(1, 3, EVAL_SIZE, EVAL_SIZE))
+    print(f"{model_id}: {spec['display_name']} params={spec['params']:,} modules={spec['module_ops']} output={tuple(out.shape)}")
+
+spec = get_model_spec(MODEL_ID)
+print(f"Selected model: {MODEL_ID} / {spec['display_name']}")
+
+
+# Training, metrics, diagnostics
+class EMA:
+    def __init__(self, model: nn.Module, decay: float):
+        self.decay = decay
+        self.shadow = {name: param.detach().clone() for name, param in model.named_parameters() if param.requires_grad}
+        self.backup: dict[str, torch.Tensor] = {}
+
+    def update(self, model: nn.Module) -> None:
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name].mul_(self.decay).add_(param.detach(), alpha=1.0 - self.decay)
+
+    def apply_shadow(self, model: nn.Module) -> None:
+        self.backup = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad and name in self.shadow:
+                self.backup[name] = param.detach().clone()
+                param.data.copy_(self.shadow[name])
+
+    def restore(self, model: nn.Module) -> None:
+        for name, param in model.named_parameters():
+            if name in self.backup:
+                param.data.copy_(self.backup[name])
+        self.backup = {}
+
+
+def optimizer_with_fallback(model: nn.Module, train_cfg: dict[str, Any]) -> torch.optim.Optimizer:
+    kwargs = {"lr": train_cfg["lr"], "weight_decay": train_cfg["weight_decay"]}
+    if torch.cuda.is_available():
+        try:
+            return AdamW(model.parameters(), fused=True, **kwargs)
+        except (TypeError, RuntimeError):
+            pass
+    return AdamW(model.parameters(), **kwargs)
+
+
+def lr_for_epoch(epoch: int, total: int, base_lr: float, warmup: int, min_ratio: float) -> float:
+    if warmup > 0 and epoch < warmup:
+        return base_lr * float(epoch + 1) / float(warmup)
+    progress = (epoch - warmup) / max(1, total - warmup - 1)
+    progress = min(max(progress, 0.0), 1.0)
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return base_lr * min_ratio + (base_lr - base_lr * min_ratio) * cosine
+
+
+def move_batch(lr_img: torch.Tensor, hr_img: torch.Tensor, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    lr_img = lr_img.to(device, non_blocking=True)
+    hr_img = hr_img.to(device, non_blocking=True)
+    if channels_last and device.type == "cuda":
+        lr_img = lr_img.contiguous(memory_format=torch.channels_last)
+        hr_img = hr_img.contiguous(memory_format=torch.channels_last)
+    return lr_img, hr_img
+
+
+def charbonnier_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    diff = pred - target
+    return torch.mean(torch.sqrt(diff * diff + eps * eps))
+
+
+def edge_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    pred_dx = pred[:, :, :, 1:] - pred[:, :, :, :-1]
+    pred_dy = pred[:, :, 1:, :] - pred[:, :, :-1, :]
+    target_dx = target[:, :, :, 1:] - target[:, :, :, :-1]
+    target_dy = target[:, :, 1:, :] - target[:, :, :-1, :]
+    return 0.5 * (F.l1_loss(pred_dx, target_dx) + F.l1_loss(pred_dy, target_dy))
+
+
+def restoration_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    return 0.60 * charbonnier_loss(pred, target, eps) + 0.30 * F.l1_loss(pred, target) + 0.10 * edge_loss(pred, target)
+
+
+def compute_psnr(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    return tensor_psnr(pred.clamp(0.0, 1.0), target.clamp(0.0, 1.0))
+
+
+def synthetic_stats_from_dataset(dataset: Dataset) -> dict[str, Any]:
+    params = getattr(dataset, "last_params", [])
+    if not params:
+        return {"count": 0}
+    keys = ["baseline_psnr", "mean_abs_residual", "grad_ratio", "lap_ratio"]
+    out: dict[str, Any] = {"count": len(params), "accepted_fraction": sum(bool(row.get("accepted")) for row in params) / len(params)}
+    for key in keys:
+        vals = [float(row[key]) for row in params if key in row]
+        if vals:
+            out[f"synthetic_{key}_mean"] = float(np.mean(vals))
+            out[f"synthetic_{key}_p50"] = float(np.quantile(vals, 0.5))
+    return out
+
+
+def maybe_fail_on_easy_synthetic(stats: dict[str, Any], stage_name: str) -> None:
+    mean_psnr = stats.get("synthetic_baseline_psnr_mean")
+    if mean_psnr is None:
+        return
+    if stage_name in {"synthetic_warmup", "mixed_finetune"} and mean_psnr >= 25.0:
+        raise RuntimeError(f"Calibrated synthetic data drifted too easy: mean baseline PSNR={mean_psnr:.3f} dB")
+
+
+def train_one_epoch(model: nn.Module, loader: DataLoader, optimizer: torch.optim.Optimizer, train_cfg: dict[str, Any], ema: EMA | None, scaler=None) -> dict[str, float]:
+    model.train()
+    total_loss, total_psnr, n = 0.0, 0.0, 0
+    for step, (lr_img, hr_img, _, _) in enumerate(loader):
+        if MAX_STEPS_PER_EPOCH > 0 and step >= MAX_STEPS_PER_EPOCH:
+            break
+        lr_img, hr_img = move_batch(lr_img, hr_img, device)
+        optimizer.zero_grad(set_to_none=True)
+        if scaler is not None:
+            with autocast_context(device, amp_policy):
+                pred = model(lr_img)
+                loss = restoration_loss(pred, hr_img, eps=train_cfg["charb_eps"])
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg["grad_clip_norm"])
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            with autocast_context(device, amp_policy):
+                pred = model(lr_img)
+                loss = restoration_loss(pred, hr_img, eps=train_cfg["charb_eps"])
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg["grad_clip_norm"])
+            optimizer.step()
+        if ema is not None:
+            ema.update(model)
+        bs = lr_img.size(0)
+        total_loss += float(loss.item()) * bs
+        with torch.no_grad():
+            total_psnr += compute_psnr(pred.detach(), hr_img).sum().item()
+        n += bs
+    return {"train_loss": total_loss / max(1, n), "train_psnr_online": total_psnr / max(1, n)}
+
+
+@torch.no_grad()
+def evaluate_loader(model: nn.Module, loader: DataLoader, train_cfg: dict[str, Any], split_name: str) -> dict[str, float]:
+    model.eval()
+    total_loss, total_psnr, total_input_psnr, total_delta, total_res_ratio, n = 0.0, 0.0, 0.0, 0.0, 0.0, 0
+    hard_buckets = {"hard": [], "mid": [], "easy": []}
+    worst: list[dict[str, Any]] = []
+    for step, (lr_img, hr_img, names, sources) in enumerate(loader):
+        if MAX_EVAL_BATCHES > 0 and step >= MAX_EVAL_BATCHES:
+            break
+        lr_img, hr_img = move_batch(lr_img, hr_img, device)
+        with autocast_context(device, amp_policy):
+            pred = model(lr_img)
+            loss = restoration_loss(pred, hr_img, eps=train_cfg["charb_eps"])
+        psnr = compute_psnr(pred, hr_img)
+        input_psnr = compute_psnr(lr_img, hr_img)
+        delta = psnr - input_psnr
+        residual_pred = (pred - lr_img).abs().mean(dim=(1, 2, 3))
+        residual_target = (hr_img - lr_img).abs().mean(dim=(1, 2, 3)).clamp_min(1e-8)
+        residual_ratio = residual_pred / residual_target
+        bs = lr_img.size(0)
+        total_loss += float(loss.item()) * bs
+        total_psnr += psnr.sum().item()
+        total_input_psnr += input_psnr.sum().item()
+        total_delta += delta.sum().item()
+        total_res_ratio += residual_ratio.sum().item()
+        n += bs
+        for i in range(bs):
+            inp = float(input_psnr[i].item())
+            pred_p = float(psnr[i].item())
+            item = {"name": str(names[i]), "source": str(sources[i]), "input_psnr": inp, "pred_psnr": pred_p, "delta_psnr": pred_p - inp, "residual_ratio": float(residual_ratio[i].item())}
+            if split_name == "paired_val":
+                bucket = "hard" if inp < 21.0 else ("mid" if inp < 24.5 else "easy")
+                hard_buckets[bucket].append(pred_p)
+                worst.append(item)
+    metrics = {
+        f"{split_name}_loss": total_loss / max(1, n),
+        f"{split_name}_psnr": total_psnr / max(1, n),
+        f"{split_name}_input_psnr": total_input_psnr / max(1, n),
+        f"{split_name}_delta_psnr": total_delta / max(1, n),
+        f"{split_name}_residual_ratio": total_res_ratio / max(1, n),
+    }
+    if split_name == "paired_val":
+        for bucket, vals in hard_buckets.items():
+            if vals:
+                metrics[f"paired_val_{bucket}_psnr"] = float(np.mean(vals))
+        worst_sorted = sorted(worst, key=lambda row: row["pred_psnr"])[:10]
+        metrics["paired_val_worst10"] = worst_sorted  # type: ignore[assignment]
+    return metrics
+
+
+def load_history(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+def save_checkpoint(path: Path, model: nn.Module, optimizer: torch.optim.Optimizer, epoch: int, metrics: dict[str, Any], best_metric: float, best_epoch: int, model_cfg: dict[str, Any], train_cfg: dict[str, Any], ema: EMA | None, scaler=None) -> None:
+    state = {
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "metrics": metrics,
+        "best_metric": best_metric,
+        "best_epoch": best_epoch,
+        "model_cfg": model_cfg,
+        "train_cfg": train_cfg,
+        "data_cfg": DATA_CFG,
+        "amp_policy": amp_policy,
+    }
+    if ema is not None:
+        state["ema_shadow"] = ema.shadow
+    if scaler is not None:
+        state["scaler_state_dict"] = scaler.state_dict()
+    torch.save(state, path)
+
+
+def load_weights(model: nn.Module, checkpoint_path: Path, map_location: str | torch.device = "cpu", use_ema: bool = True) -> dict[str, Any]:
+    ckpt = torch.load(checkpoint_path, map_location=map_location)
+    model.load_state_dict(ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt)
+    if use_ema and isinstance(ckpt, dict) and "ema_shadow" in ckpt:
+        for name, param in model.named_parameters():
+            if name in ckpt["ema_shadow"]:
+                param.data.copy_(ckpt["ema_shadow"][name].to(param.device))
+    return ckpt
+
+
+def stage_dir(stage_name: str) -> Path:
+    return OUTPUT_DIR / MODEL_ID / stage_name
+
+
+def fit_stage(model: nn.Module, stage_name: str, init_checkpoint: Path | None = None) -> Path:
+    train_cfg = TRAIN_CFG_BY_STAGE[stage_name]
+    loaders = make_stage_loaders(stage_name, SEED + {"synthetic_warmup": 0, "mixed_finetune": 101, "paired_polish": 202}[stage_name])
+    output_dir = stage_dir(stage_name)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    metrics_path = output_dir / "metrics.jsonl"
+    last_ckpt = output_dir / "last.pt"
+    best_ckpt = output_dir / "best.pt"
+    selection_metric = train_cfg["selection_metric"]
+
+    model = model.to(device)
+    if channels_last and device.type == "cuda":
+        model = model.to(memory_format=torch.channels_last)
+    optimizer = optimizer_with_fallback(model, train_cfg)
+    ema = EMA(model, decay=train_cfg["ema_decay"])
+    scaler = make_grad_scaler(amp_policy)
+    start_epoch, best_metric, best_epoch = 0, float("-inf"), -1
+    history: list[dict[str, Any]] = []
+
+    if RESUME_TRAINING and last_ckpt.exists():
+        ckpt = torch.load(last_ckpt, map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        if "ema_shadow" in ckpt:
+            ema.shadow = ckpt["ema_shadow"]
+        if scaler is not None and "scaler_state_dict" in ckpt:
+            scaler.load_state_dict(ckpt["scaler_state_dict"])
+        start_epoch = int(ckpt["epoch"])
+        best_metric = float(ckpt.get("best_metric", float("-inf")))
+        best_epoch = int(ckpt.get("best_epoch", -1))
+        history = load_history(metrics_path)
+        print(f"Resuming {stage_name} from epoch {start_epoch}/{train_cfg['epochs']}")
+    else:
+        if init_checkpoint is not None and init_checkpoint.exists():
+            load_weights(model, init_checkpoint, map_location=device, use_ema=True)
+            ema = EMA(model, decay=train_cfg["ema_decay"])
+            print(f"Initialized {stage_name} from {init_checkpoint}")
+        metrics_path.write_text("")
+        print(f"Fresh start: {stage_name}")
+
+    print(f"\n{'epoch':>5} | {'lr':>8} | {'train':>8} {'train_eval':>10} | {'paired':>8} {'delta':>8} {'hard':>8} {'synthetic':>9} | {'best':>8} | {'time':>6}")
+    print("-" * 118)
+    epochs_without_improve = 0
+    for epoch in range(start_epoch, train_cfg["epochs"]):
+        epoch_num = epoch + 1
+        epoch_lr = lr_for_epoch(epoch, train_cfg["epochs"], train_cfg["lr"], train_cfg["warmup_epochs"], train_cfg["min_lr_ratio"])
+        for group in optimizer.param_groups:
+            group["lr"] = epoch_lr
+        start_time = time.time()
+        train_metrics = train_one_epoch(model, loaders["train_loader"], optimizer, train_cfg, ema, scaler=scaler)
+        ema.apply_shadow(model)
+        train_eval_metrics = evaluate_loader(model, loaders["train_eval_loader"], train_cfg, "train_eval") if epoch_num == train_cfg["epochs"] or epoch_num % train_cfg["train_eval_interval"] == 0 else {}
+        paired_metrics = evaluate_loader(model, loaders["paired_val_loader"], train_cfg, "paired_val")
+        synthetic_metrics = evaluate_loader(model, loaders["synthetic_val_loader"], train_cfg, "synthetic_val") if stage_name != "paired_polish" else {}
+        ema.restore(model)
+        synthetic_stats = synthetic_stats_from_dataset(loaders["train"] if isinstance(loaders["train"], CalibratedSyntheticSRDataset) else (loaders["train"].datasets[1] if isinstance(loaders["train"], ConcatDataset) and len(loaders["train"].datasets) > 1 else loaders["train"]))
+        maybe_fail_on_easy_synthetic(synthetic_stats, stage_name)
+        row: dict[str, Any] = {
+            "epoch": epoch_num,
+            "lr": epoch_lr,
+            "stage": stage_name,
+            "model_id": MODEL_ID,
+            **train_metrics,
+            **train_eval_metrics,
+            **paired_metrics,
+            **synthetic_metrics,
+            **synthetic_stats,
+            "seconds": round(time.time() - start_time, 1),
+            "selection_metric": selection_metric,
+        }
+        row["selection_metric_value"] = row[selection_metric]
+        history.append(row)
+        with metrics_path.open("a") as f:
+            f.write(json.dumps(row) + "\n")
+        metric_value = float(row[selection_metric])
+        improved = metric_value > best_metric
+        if improved:
+            best_metric, best_epoch, epochs_without_improve = metric_value, epoch_num, 0
+        else:
+            epochs_without_improve += 1
+        save_checkpoint(last_ckpt, model, optimizer, epoch_num, row, best_metric, best_epoch, spec["model_cfg"], train_cfg, ema, scaler=scaler)
+        if improved:
+            save_checkpoint(best_ckpt, model, optimizer, epoch_num, row, best_metric, best_epoch, spec["model_cfg"], train_cfg, ema, scaler=scaler)
+        if epoch_num % train_cfg["checkpoint_interval"] == 0:
+            save_checkpoint(output_dir / f"epoch_{epoch_num:03d}.pt", model, optimizer, epoch_num, row, best_metric, best_epoch, spec["model_cfg"], train_cfg, ema, scaler=scaler)
+        print(f"{epoch_num:5d} | {epoch_lr:8.2e} | {row['train_psnr_online']:8.3f} {row.get('train_eval_psnr', float('nan')):10.3f} | {row['paired_val_psnr']:8.3f} {row['paired_val_delta_psnr']:8.3f} {row.get('paired_val_hard_psnr', float('nan')):8.3f} {row.get('synthetic_val_psnr', float('nan')):9.3f} | {best_metric:8.3f} | {row['seconds']:6.1f}{'*' if improved else ' '}")
+        if epochs_without_improve >= train_cfg["early_stop_patience"]:
+            print(f"Early stopping {stage_name} after {train_cfg['early_stop_patience']} epochs without improvement.")
+            break
+    summary = {"stage": stage_name, "best_epoch": best_epoch, "best_metric": best_metric, "best_ckpt": str(best_ckpt), "last_row": history[-1] if history else None}
+    (output_dir / "summary.json").write_text(json.dumps(summary, indent=2))
+    return best_ckpt
+
+
+# Smoke test and optional full training
+if RUN_SMOKE_TESTS:
+    for model_id, model_spec in MODEL_REGISTRY.items():
+        probe = model_spec["build_model"](**model_spec["model_cfg"]).to(device)
+        probe.eval()
+        with torch.no_grad():
+            x = torch.randn(1, 3, EVAL_SIZE, EVAL_SIZE, device=device)
+            y = probe(x)
+        assert tuple(y.shape) == (1, 3, EVAL_SIZE, EVAL_SIZE), (model_id, tuple(y.shape))
+    print("Model smoke tests passed.")
+
+    test_loaders = make_stage_loaders("mixed_finetune", SEED + 303)
+    lr_t, hr_t, names, sources = next(iter(test_loaders["train_loader"]))
+    assert tuple(lr_t.shape[-3:]) == (3, TRAIN_PATCH_SIZE, TRAIN_PATCH_SIZE)
+    assert tuple(hr_t.shape[-3:]) == (3, TRAIN_PATCH_SIZE, TRAIN_PATCH_SIZE)
+    print(f"Loader smoke test passed: {tuple(lr_t.shape)} from sources sample={sources[0]}")
+
+best_checkpoint_by_stage: dict[str, Path] = {}
+if RUN_FULL_TRAINING:
+    model = spec["build_model"](**spec["model_cfg"])
+    init_ckpt = None
+    for stage in ["synthetic_warmup", "mixed_finetune", "paired_polish"]:
+        best_ckpt = fit_stage(model, stage, init_checkpoint=init_ckpt)
+        best_checkpoint_by_stage[stage] = best_ckpt
+        init_ckpt = best_ckpt
+    FINAL_BEST_CKPT = best_checkpoint_by_stage["paired_polish"]
+else:
+    print("Full training skipped. Set LAB2_RUN_FULL_TRAINING=1 to run all three stages.")
+    FINAL_BEST_CKPT = None
+
+
+# Checkpoint averaging / SWA-style late checkpoint evaluation
+def average_checkpoints(checkpoints: list[Path], output_path: Path) -> Path | None:
+    checkpoints = [Path(p) for p in checkpoints if Path(p).exists()]
+    if not checkpoints:
+        return None
+    avg_state: dict[str, torch.Tensor] = {}
+    template: dict[str, Any] | None = None
+    for idx, ckpt_path in enumerate(checkpoints):
+        ckpt = torch.load(ckpt_path, map_location="cpu")
+        template = ckpt if template is None else template
+        source = ckpt.get("ema_shadow") or ckpt["model_state_dict"]
+        for name, tensor in source.items():
+            if not torch.is_tensor(tensor):
+                continue
+            tensor = tensor.detach().float()
+            if idx == 0:
+                avg_state[name] = tensor.clone()
+            else:
+                avg_state[name].add_(tensor)
+    for tensor in avg_state.values():
+        tensor.div_(len(checkpoints))
+    assert template is not None
+    averaged = dict(template)
+    averaged["model_state_dict"] = template["model_state_dict"]
+    averaged["ema_shadow"] = avg_state
+    averaged["averaged_from"] = [str(p) for p in checkpoints]
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(averaged, output_path)
+    return output_path
+
+
+def collect_late_checkpoints(stage_name: str, max_count: int = 4) -> list[Path]:
+    root = stage_dir(stage_name)
+    candidates = sorted(root.glob("epoch_*.pt")) + ([root / "best.pt"] if (root / "best.pt").exists() else [])
+    unique = []
+    seen = set()
+    for path in candidates:
+        if path not in seen:
+            seen.add(path)
+            unique.append(path)
+    return unique[-max_count:]
+
+if RUN_FULL_TRAINING:
+    late = collect_late_checkpoints("paired_polish", max_count=4)
+    avg_path = average_checkpoints(late, stage_dir("paired_polish") / "averaged_late.pt")
+    if avg_path is not None:
+        eval_model = spec["build_model"](**spec["model_cfg"]).to(device)
+        load_weights(eval_model, avg_path, map_location=device, use_ema=True)
+        loaders = make_stage_loaders("paired_polish", SEED + 404)
+        avg_metrics = evaluate_loader(eval_model, loaders["paired_val_loader"], TRAIN_CFG_BY_STAGE["paired_polish"], "paired_val")
+        (stage_dir("paired_polish") / "averaged_late_metrics.json").write_text(json.dumps(avg_metrics, indent=2))
+        print(f"Averaged late checkpoint metrics: paired_val_psnr={avg_metrics['paired_val_psnr']:.3f}")
+else:
+    print("Checkpoint averaging skipped because full training did not run.")
+
+
+# ONNX export, op audit, calibration export, and optional MXQ build
+def audit_onnx_ops(onnx_path: Path, output_path: Path | None = None) -> dict[str, Any]:
+    if onnx is None:
+        print("onnx is not installed; skipping op audit")
+        return {"status": "skipped", "reason": "onnx not installed"}
+    model = onnx.load(str(onnx_path))
+    counts: dict[str, int] = defaultdict(int)
+    for node in model.graph.node:
+        counts[node.op_type] += 1
+    supported = {op: n for op, n in sorted(counts.items()) if op in MOBILINT_NPU_SUPPORTED_ONNX}
+    cpu_fallback = {op: n for op, n in sorted(counts.items()) if op in MOBILINT_CPU_FALLBACK_ONNX}
+    unknown = {op: n for op, n in sorted(counts.items()) if op not in MOBILINT_NPU_SUPPORTED_ONNX and op not in MOBILINT_CPU_FALLBACK_ONNX}
+    audit = {"onnx_path": str(onnx_path), "counts": dict(sorted(counts.items())), "npu_supported": supported, "cpu_fallback_reported": cpu_fallback, "unknown": unknown}
+    if output_path is not None:
+        output_path.write_text(json.dumps(audit, indent=2))
+    print("ONNX op audit:")
+    print(json.dumps({"npu_supported": supported, "cpu_fallback_reported": cpu_fallback, "unknown": unknown}, indent=2))
+    return audit
+
+
+def export_to_onnx(checkpoint_path: Path, onnx_path: Path, verify: bool = True) -> Path:
+    model = spec["build_model"](**spec["model_cfg"]).to(device)
+    load_weights(model, checkpoint_path, map_location=device, use_ema=True)
+    model.eval()
+    dummy = torch.randn(1, 3, EVAL_SIZE, EVAL_SIZE, device=device)
+    onnx_path.parent.mkdir(parents=True, exist_ok=True)
+    export_kwargs = dict(export_params=True, opset_version=13, do_constant_folding=True, input_names=["input"], output_names=["output"])
+    try:
+        torch.onnx.export(model, dummy, str(onnx_path), dynamo=False, **export_kwargs)
+    except TypeError:
+        torch.onnx.export(model, dummy, str(onnx_path), **export_kwargs)
+    if onnx is not None:
+        onnx.checker.check_model(onnx.load(str(onnx_path)))
+        print("ONNX checker passed.")
+    if verify and ort is not None:
+        sample_loader = make_stage_loaders("paired_polish", SEED + 505)["paired_val_loader"]
+        sample_lr, _, _, _ = next(iter(sample_loader))
+        sample_lr = sample_lr[:1].to(device)
+        with torch.no_grad():
+            torch_out = model(sample_lr).detach().cpu().numpy()
+        sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+        ort_out = sess.run(["output"], {"input": sample_lr.cpu().numpy()})[0]
+        diff = np.abs(torch_out - ort_out)
+        print(f"ONNX Runtime parity: max_diff={diff.max():.8f}, mean_diff={diff.mean():.8f}")
+    print(f"Exported ONNX: {onnx_path} ({onnx_path.stat().st_size / 1024:.0f} KB)")
+    audit_onnx_ops(onnx_path, onnx_path.with_name("onnx_ops.json"))
+    return onnx_path
+
+
+@torch.no_grad()
+def score_lr_tensor(lr_t: torch.Tensor, hr_t: torch.Tensor | None = None) -> dict[str, float]:
+    gray = lr_t.float().mean(dim=0)
+    grad_x = gray[:, 1:] - gray[:, :-1]
+    grad_y = gray[1:, :] - gray[:-1, :]
+    out = {
+        "brightness": float(gray.mean().item()),
+        "contrast": float(gray.std().item()),
+        "texture": float(0.5 * (grad_x.abs().mean().item() + grad_y.abs().mean().item())),
+    }
+    if hr_t is not None:
+        out["baseline_psnr"] = float(tensor_psnr(lr_t.unsqueeze(0), hr_t.unsqueeze(0))[0].item())
+    return out
+
+
+def select_calibration_records(loader: DataLoader, num_samples: int, seed: int) -> list[dict[str, Any]]:
+    records = []
+    for idx, (lr_t, hr_t, names, sources) in enumerate(loader):
+        lr = lr_t[0]
+        hr = hr_t[0]
+        records.append({"loader_index": idx, "name": str(names[0]), "source": str(sources[0]), **score_lr_tensor(lr, hr)})
+    if not records:
+        return []
+    for metric in ["brightness", "texture", "baseline_psnr"]:
+        vals = np.array([row[metric] for row in records], dtype=np.float32)
+        lo, hi = np.quantile(vals, [1 / 3, 2 / 3])
+        for row in records:
+            row[f"{metric}_bin"] = "low" if row[metric] <= lo else ("high" if row[metric] >= hi else "mid")
+    rng = random.Random(seed)
+    buckets: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    for row in records:
+        buckets[(row["source"], row["brightness_bin"], row["texture_bin"])].append(row)
+    for bucket in buckets.values():
+        rng.shuffle(bucket)
+    selected, seen = [], set()
+    keys = sorted(buckets)
+    while len(selected) < min(num_samples, len(records)):
+        progress = False
+        for key in keys:
+            while buckets[key]:
+                row = buckets[key].pop()
+                if row["loader_index"] in seen:
+                    continue
+                selected.append(row)
+                seen.add(row["loader_index"])
+                progress = True
+                break
+            if len(selected) >= min(num_samples, len(records)):
+                break
+        if not progress:
+            break
+    return selected
+
+
+def export_calibration_artifacts(output_dir: Path, cfg: dict[str, Any]) -> Path:
+    loaders = make_stage_loaders("paired_polish", SEED + 606)
+    loader = loaders["calibration_loader"]
+    selected = select_calibration_records(loader, cfg["num_samples"], cfg["seed"])
+    by_index = {row["loader_index"]: row for row in selected}
+    cal_dir = output_dir / cfg["output_subdir"]
+    cal_dir.mkdir(parents=True, exist_ok=True)
+    batch = []
+    manifest = []
+    for idx, (lr_t, hr_t, names, sources) in enumerate(loader):
+        if idx not in by_index:
+            continue
+        row = by_index[idx]
+        lr = lr_t[0]
+        batch.append(lr)
+        image_path = cal_dir / f"{len(manifest):03d}_{slugify_name(row['source'])}_{slugify_name(row['name'])}.png"
+        TO_PIL(lr).save(image_path)
+        manifest.append({**row, "image_path": str(image_path)})
+        if len(manifest) >= len(selected):
+            break
+    tensor_path = cal_dir / "calibration_inputs.pt"
+    if batch:
+        torch.save(torch.stack(batch), tensor_path)
+    summary = summarize_numeric(manifest, ["brightness", "contrast", "texture", "baseline_psnr"]) if manifest else {"count": 0}
+    (cal_dir / "manifest.json").write_text(json.dumps({"config": cfg, "summary": summary, "samples": manifest}, indent=2))
+    print(f"Exported calibration artifacts: {cal_dir} ({len(manifest)} samples)")
+    return cal_dir
+
+
+def resolve_mxq_command(onnx_path: Path, calibration_dir: Path, out_mxq: Path) -> list[str]:
+    compiler_bin = os.environ.get("MOBILINT_COMPILER_BIN") or os.environ.get("LAB2_COMPILER_BIN")
+    compiler_args_raw = os.environ.get("LAB2_COMPILER_ARGS", "")
+    if not compiler_bin:
+        return []
+    tokens = {
+        "onnx": str(onnx_path),
+        "calibration_dir": str(calibration_dir),
+        "manifest": str(calibration_dir / "manifest.json"),
+        "inputs": str(calibration_dir / "calibration_inputs.pt"),
+        "out_mxq": str(out_mxq),
+        "run_dir": str(onnx_path.parent),
+    }
+    args = [part.format(**tokens) for part in shlex.split(compiler_args_raw)]
+    return [compiler_bin, *args]
+
+
+def run_mxq_build(onnx_path: Path, calibration_dir: Path, dry_run: bool, execute: bool) -> dict[str, Any]:
+    out_mxq = onnx_path.with_suffix(".mxq")
+    command = resolve_mxq_command(onnx_path, calibration_dir, out_mxq)
+    log = {
+        "dry_run": dry_run,
+        "execute": execute,
+        "onnx_path": str(onnx_path),
+        "calibration_dir": str(calibration_dir),
+        "out_mxq": str(out_mxq),
+        "resolved_command": command,
+        "resolved_command_shell": shlex.join(command) if command else None,
+        "compiler_configured": bool(command),
+    }
+    manifest_path = calibration_dir / "manifest.json"
+    inputs_path = calibration_dir / "calibration_inputs.pt"
+    missing = [str(p) for p in [onnx_path, manifest_path, inputs_path] if not p.exists()]
+    if missing:
+        log["status"] = "missing_inputs"
+        log["missing"] = missing
+    elif dry_run or not execute:
+        log["status"] = "dry_run" if command else "dry_run_no_compiler"
+    else:
+        if not command:
+            log["status"] = "skipped_no_compiler"
+        elif not (Path(command[0]).expanduser().exists() or shutil.which(command[0])):
+            log["status"] = "compiler_not_found"
+        else:
+            proc = subprocess.run(command, capture_output=True, text=True, check=False)
+            log.update({"status": "ok" if proc.returncode == 0 else "failed", "returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr, "mxq_exists": out_mxq.exists()})
+    log_path = onnx_path.with_name("mxq_build.json")
+    log_path.write_text(json.dumps(log, indent=2))
+    print(f"MXQ build log: {log_path} | status={log['status']}")
+    if log.get("resolved_command_shell"):
+        print(f"Resolved compiler command: {log['resolved_command_shell']}")
+    return log
+
+if RUN_ONNX_EXPORT:
+    if FINAL_BEST_CKPT is None:
+        candidate = stage_dir("paired_polish") / "best.pt"
+        if candidate.exists():
+            FINAL_BEST_CKPT = candidate
+    if FINAL_BEST_CKPT is not None and Path(FINAL_BEST_CKPT).exists():
+        onnx_path = export_to_onnx(Path(FINAL_BEST_CKPT), stage_dir("paired_polish") / "best.onnx", verify=True)
+        cal_dir = export_calibration_artifacts(onnx_path.parent, CALIBRATION_CFG)
+        if RUN_MXQ_DRY_RUN or RUN_MXQ_COMPILE:
+            run_mxq_build(onnx_path, cal_dir, dry_run=RUN_MXQ_DRY_RUN and not RUN_MXQ_COMPILE, execute=RUN_MXQ_COMPILE)
+    else:
+        print("ONNX export skipped because no final checkpoint exists yet. Run full training first or place best.pt under the paired_polish stage dir.")
+else:
+    print("ONNX export skipped by configuration.")
+
